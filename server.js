@@ -1,6 +1,7 @@
 // server.js
 const express = require("express");
 const axios = require("axios");
+const { ClientCredentials } = require("simple-oauth2");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -11,6 +12,8 @@ const TRESTLE_TOKEN_URL =
 const TRESTLE_API_BASE = "https://api-trestle.corelogic.com";
 const CLIENT_ID = process.env.TRESTLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.TRESTLE_CLIENT_SECRET;
+// Scope: "api" for WebAPI (default), "rets" for RETS feeds
+const SCOPE = process.env.TRESTLE_SCOPE || "api";
 const TOKEN_SAFETY_SECONDS = Number(process.env.TOKEN_REFRESH_SAFETY_SECONDS || 300);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
@@ -32,10 +35,18 @@ let tokenCache = {
   expiresAt: 0, // epoch ms
 };
 
+// === OAuth2 client ===
+const oauthClient = new ClientCredentials({
+  client: { id: CLIENT_ID, secret: CLIENT_SECRET },
+  auth: {
+    tokenHost: "https://api-trestle.corelogic.com",
+    tokenPath: "/trestle/oidc/connect/token",
+  },
+});
+
 async function getAccessToken() {
   const now = Date.now();
 
-  // Reuse cached token if still valid beyond safety window
   if (
     tokenCache.accessToken &&
     tokenCache.expiresAt - TOKEN_SAFETY_SECONDS * 1000 > now
@@ -51,19 +62,9 @@ async function getAccessToken() {
     throw new Error("Missing TRESTLE_CLIENT_ID or TRESTLE_CLIENT_SECRET");
   }
 
-  const body = new URLSearchParams({
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
-    grant_type: "client_credentials",
-    scope: "api",
-  });
+  const access = await oauthClient.getToken({ scope: SCOPE });
+  const { access_token, expires_in, token_type } = access.token || {};
 
-  const resp = await axios.post(TRESTLE_TOKEN_URL, body.toString(), {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    timeout: 15000,
-  });
-
-  const { access_token, expires_in, token_type } = resp.data || {};
   if (!access_token || token_type !== "Bearer") {
     throw new Error("Unexpected token response from Trestle.");
   }
@@ -98,6 +99,7 @@ app.get("/_debug/token-cache", (req, res) => {
       : null,
     msUntilExpiry: tokenCache.expiresAt ? tokenCache.expiresAt - now : null,
     safetyWindowSeconds: TOKEN_SAFETY_SECONDS,
+    scope: SCOPE,
   });
 });
 
@@ -108,7 +110,7 @@ app.all("/api/trestle/*", async (req, res) => {
     const targetPath = req.params[0] || "";
     const normalized = `/${targetPath}`.replace(/\/{2,}/g, "/");
 
-    // Block access to the token endpoint via proxy
+    // Block direct calls to token endpoint
     if (normalized.toLowerCase().includes("/trestle/oidc/connect/token")) {
       return res.status(403).json({ error: "Forbidden path." });
     }
@@ -134,7 +136,7 @@ app.all("/api/trestle/*", async (req, res) => {
       validateStatus: () => true,
     });
 
-    // If upstream says unauthorized, clear cache and retry once
+    // Retry once if unauthorized
     if (trestleResp.status === 401) {
       tokenCache.accessToken = null;
       const fresh = await getAccessToken();
