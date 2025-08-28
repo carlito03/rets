@@ -1,17 +1,11 @@
 {
-    "name": "cloudrun-node",
-    "version": "1.0.1",
-    "description": "Cloud Run Express proxy for Trestle Web API",
-    "main": "server.js",
-    "scripts": {
-      "start": "node server.js"
-    },
-    "engines": {
-      "node": ">=18"
-    },
-    "dependencies": {
-      "axios": "^1.7.7",
-  "express": "^4.19.2",
-  "simple-oauth2": "^5.1.0"
-    }
+  "name": "trestle-proxy",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "express": "^4.19.2"
   }
+}
