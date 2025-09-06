@@ -1,4 +1,4 @@
-// server.js — CommonJS, Node 18+ (uses global fetch), Express only
+// server.js — CommonJS, Node 18+ (global fetch), Express only
 const express = require('express');
 const app = express();
 
@@ -16,6 +16,8 @@ async function getApiToken() {
 
   const cid = process.env.TRESTLE_CLIENT_ID;
   const csec = process.env.TRESTLE_CLIENT_SECRET;
+
+  // Don't crash on startup if env vars are missing; just fail when an endpoint uses the token
   if (!cid || !csec) {
     throw new Error('Missing TRESTLE_CLIENT_ID / TRESTLE_CLIENT_SECRET environment variables');
   }
@@ -45,10 +47,22 @@ async function getApiToken() {
 }
 
 // ---- Helpers ----
+function escapeOdataString(s) { return String(s).replace(/'/g, "''"); }
+
+function buildBaseFilter({ city, days, minPrice, maxPrice }) {
+  const filters = [];
+  if (city) filters.push(`City eq '${escapeOdataString(city)}'`);
+  const cutoffISO = new Date(Date.now() - (Number(days) || 90) * 24 * 3600 * 1000).toISOString();
+  filters.push(`ModificationTimestamp ge ${cutoffISO}`);
+  if (Number.isFinite(minPrice)) filters.push(`ListPrice ge ${minPrice}`);
+  if (Number.isFinite(maxPrice)) filters.push(`ListPrice le ${maxPrice}`);
+  return filters;
+}
+
 function buildParams({ select, top = 50, filter, orderby = 'ModificationTimestamp desc' }) {
   const p = new URLSearchParams();
   p.set('$count', 'true');
-  p.set('$top', String(Math.min(Number(top) || 50, 1000))); // hard cap at 1000
+  p.set('$top', String(Math.min(Number(top) || 50, 1000)));
   p.set('$orderby', orderby);
   if (select) p.set('$select', select);
   if (filter) p.set('$filter', filter);
@@ -57,104 +71,91 @@ function buildParams({ select, top = 50, filter, orderby = 'ModificationTimestam
 
 async function fetchOData(url) {
   const token = await getApiToken();
-  const r = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json'
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
+  const txt = await r.text();
+  if (!r.ok) throw new Error(`OData fetch failed ${r.status} ${r.statusText} - ${txt}`);
+  try { return JSON.parse(txt); } catch { throw new Error(`OData returned non-JSON body: ${txt.slice(0, 300)}...`); }
+}
+
+async function fetchCityListings({ city, top, days, minPrice, maxPrice, status = 'Active' }) {
+  const baseFilters = buildBaseFilter({ city, days, minPrice, maxPrice });
+  const SELECT_FIELDS = [
+    'ListingKey','ListingId','City','PostalCode','ListPrice','ModificationTimestamp'
+  ].join(',');
+
+  const attempts = [
+    { field: 'StandardStatus', clause: status ? ` and StandardStatus eq '${escapeOdataString(status)}'` : '' },
+    { field: 'MlsStatus',      clause: status ? ` and MlsStatus eq '${escapeOdataString(status)}'` : '' },
+    { field: '(none)',         clause: '' }
+  ];
+
+  const tried = [];
+  for (const a of attempts) {
+    const filter = baseFilters.join(' and ') + a.clause;
+    const params = buildParams({ select: SELECT_FIELDS, top, filter, orderby: 'ModificationTimestamp desc' });
+    const url = `${ODATA_BASE}?${params.toString()}`;
+    try {
+      const data = await fetchOData(url);
+      return { ok: true, statusFieldUsed: a.field, query: Object.fromEntries(params.entries()), data };
+    } catch (err) {
+      tried.push({ statusFieldTried: a.field, error: err.message });
     }
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`OData fetch failed ${r.status} ${r.statusText} - ${t}`);
   }
-  return r.json();
+  return { ok: false, tried };
 }
 
 // ---- Routes ----
-app.get('/', (_req, res) => {
-  res.send('CRMLS OData proxy is running on Cloud Run ✅');
+app.get('/', (_req, res) => res.send('CRMLS OData proxy is running on Cloud Run ✅'));
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+app.get('/__routes', (_req, res) => {
+  res.json({
+    ok: true,
+    routes: ['/', '/healthz', '/__routes', '/auth/token', '/listings'],
+    note: 'If you see this JSON, you are hitting the Express app.'
+  });
 });
 
-app.get('/healthz', (_req, res) => res.json({ ok: true }));
-
-// Dev-only: inspect token (mask in logs; safe JSON response)
+// Dev-only: masked token preview
 app.get('/auth/token', async (_req, res) => {
   try {
     const tok = await getApiToken();
-    res.json({ scope: 'api', access_token: tok ? tok.slice(0, 16) + '…' : null, note: 'masked' });
+    res.json({ scope: 'api', access_token_preview: tok ? tok.slice(0, 16) + '…' : null, note: 'masked' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 /**
- * GET /listings
- * Query city-scoped, ad-hoc results to stay well under the 5k limit.
- * Query params:
- *   city        (default: Long Beach)
- *   top         (default: 50, max: 1000)
- *   minPrice    (optional)
- *   maxPrice    (optional)
- *   status      (default: Active) - often MlsStatus or StandardStatus depending on feed
- *
- * Example:
- *   /listings?city=Long%20Beach&minPrice=700000&status=Active&top=25
+ * GET /listings?city=Long%20Beach&top=25&days=90&minPrice=700000&status=Active
  */
 app.get('/listings', async (req, res) => {
   try {
     const city = (req.query.city || 'Long Beach').trim();
     const top = Math.min(parseInt(req.query.top || '50', 10) || 50, 1000);
+    const days = parseInt(req.query.days || '90', 10) || 90;
     const minPrice = req.query.minPrice ? parseInt(req.query.minPrice, 10) : null;
     const maxPrice = req.query.maxPrice ? parseInt(req.query.maxPrice, 10) : null;
     const status = (req.query.status || 'Active').trim();
 
-    // Build a safe FILTER without OriginatingSystemName (per CRMLS docs/limits)
-    const filters = [`City eq '${city.replace(/'/g, "''")}'`]; // escape single quotes
+    const result = await fetchCityListings({ city, top, days, minPrice, maxPrice, status });
+    if (!result.ok) return res.status(502).json({ error: 'All status variants failed', attempts: result.tried });
 
-    // Many CRMLS feeds expose MlsStatus; if yours uses StandardStatus, swap as needed:
-    if (status) filters.push(`MlsStatus eq '${status.replace(/'/g, "''")}'`);
-
-    if (Number.isFinite(minPrice)) filters.push(`ListPrice ge ${minPrice}`);
-    if (Number.isFinite(maxPrice)) filters.push(`ListPrice le ${maxPrice}`);
-
-    // Example: also allow a recency cut to keep results small (optional)
-    // const isoCut = new Date(Date.now() - 1000 * 60 * 60 * 24 * 60).toISOString(); // last 60 days
-    // filters.push(`ModificationTimestamp ge ${isoCut}`);
-
-    const FILTER = filters.join(' and ');
-
-    // Keep SELECT lean and universal
-    const SELECT_FIELDS = [
-      'ListingKeyNumeric',
-      'ListingId',
-      'City',
-      'PostalCode',
-      'ListPrice',
-      'PropertyType',
-      'MlsStatus',
-      'ModificationTimestamp'
-    ].join(',');
-
-    const params = buildParams({
-      select: SELECT_FIELDS,
-      top,
-      filter: FILTER,
-      orderby: 'ModificationTimestamp desc'
-    });
-
-    const url = `${ODATA_BASE}?${params.toString()}`;
-    const data = await fetchOData(url);
-
+    const { data } = result;
     res.json({
-      query: Object.fromEntries(params.entries()),
+      statusFieldUsed: result.statusFieldUsed,
+      query: result.query,
       count: Array.isArray(data.value) ? data.value.length : 0,
       odataCount: data['@odata.count'],
       value: data.value || []
     });
   } catch (e) {
-    // Always return JSON so PowerShell/curl|jq don't choke
     res.status(500).json({ error: e.message });
   }
+});
+
+// Catch-all -> JSON 404 (so you never see Google’s HTML if it’s your service)
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found', path: req.path, try: ['/', '/healthz', '/__routes', '/listings'] });
 });
 
 // ---- Start ----
