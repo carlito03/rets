@@ -49,7 +49,7 @@ const EXPAND = 'Media';
 const TOP = 1000;
 // Filter exactly like your screenshot (year >= 2020, month >= 04, system = 'CCAR')
 const FILTER =
-  "year(ListingContractDate) ge 2020 and month(ListingContractDate) ge 4 and OriginatingSystemName eq 'CCAR'";
+  "year(ListingContractDate) ge 2025 and month(ListingContractDate) ge 4 and OriginatingSystemName eq 'CRMLS'";
 
 // Build querystring safely
 function buildParams({ select, expand, top, filter, orderby = 'ListingKey' }) {
