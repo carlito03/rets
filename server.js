@@ -3,12 +3,12 @@ import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080; // Cloud Run will set this
 
-// Replace these with your CRMLS/Trestle credentials
+// Replace with your CRMLS/Trestle credentials via Cloud Run secrets or env vars
 const CLIENT_ID = process.env.TRESTLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.TRESTLE_CLIENT_SECRET;
-const SCOPE = "api"; // usually "api" works for CRMLS
+const SCOPE = "api"; // CRMLS usually accepts "api"
 
 // --- Get access token ---
 async function getAccessToken() {
@@ -48,13 +48,12 @@ async function fetchListings(city = "Long Beach") {
     throw new Error(`Listing request failed: ${res.status} ${text}`);
   }
 
-  const data = await res.json();
-  return data;
+  return res.json();
 }
 
 // --- Express routes ---
 app.get("/", (req, res) => {
-  res.send("CRMLS Listing API Proxy is running.");
+  res.send("CRMLS Listing API Proxy is running on Cloud Run 🚀");
 });
 
 app.get("/listings", async (req, res) => {
@@ -69,6 +68,6 @@ app.get("/listings", async (req, res) => {
 });
 
 // --- Start server ---
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ Server running on port ${PORT}`);
 });
