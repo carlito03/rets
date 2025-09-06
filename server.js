@@ -104,10 +104,10 @@ async function fetchAllPages(url, maxPages = 100) {
 
 // Your EXACT filter (Apr-2025 onward, inclusive)
 const FILTER_FROM_APR_2025_CCARD =
-  "(year(ListingContractDate) gt 2025 or (year(ListingContractDate) eq 2025 and month(ListingContractDate) ge 4)) and OriginatingSystemName eq 'CCAR'";
+  "(year(ListingContractDate) gt 2025 or (year(ListingContractDate) eq 2025 and month(ListingContractDate) ge 4)) and OriginatingSystemName eq 'CRMLS'";
 
 // Example route using your filter + Media expansion
-app.get('/odata/ccar-from-apr-2025', async (req, res) => {
+app.get('/odata/crmls-from-apr-2025', async (req, res) => {
   try {
     const top = req.query.top || 1000;
     // You can trim Media payload by using nested $select: Media($select=MediaURL,Order)
@@ -145,3 +145,4 @@ app.get('/odata/search', async (req, res) => {
 
 // =================== START ===================
 app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+
