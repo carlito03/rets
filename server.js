@@ -1,153 +1,219 @@
-// server.js — Minimal RESO auth + metadata + by-city
-// Node 18+ (global fetch). Only dependency: express.
+// server.js
+// Minimal Cloud Run API with CORS + API key auth for Trestle WebAPI
+
 const express = require('express');
+const cors = require('cors');
+const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+
 const app = express();
 
-const PORT = process.env.PORT || 8080;
+/* -------------------------- Config via env vars -------------------------- */
+const {
+  PORT = 8080,
 
-// --- Config ---
-const TRESTLE_HOST  = process.env.TRESTLE_HOST  || 'https://api-trestle.corelogic.com';
-const TOKEN_URL     = `${TRESTLE_HOST}/trestle/oidc/connect/token`;
-const TRESTLE_SCOPE = process.env.TRESTLE_SCOPE || 'api';
-const DEFAULT_OSN   = process.env.MLS_OSN || ''; // e.g., CRMLS
+  // Trestle creds (keep in Secret Manager -> env var)
+  TRESTLE_CLIENT_ID,
+  TRESTLE_CLIENT_SECRET,
 
-// --- Token cache ---
-let tokenCache = { access_token: null, expires_at: 0 };
+  // CORS allowlist: comma-separated, e.g. "https://client1.com,https://client2.com"
+  ALLOWED_ORIGINS = '*',
 
-async function fetchAccessToken() {
-  const client_id = process.env.TRESTLE_CLIENT_ID;
-  const client_secret = process.env.TRESTLE_CLIENT_SECRET;
-  if (!client_id || !client_secret) throw new Error('Missing TRESTLE_CLIENT_ID or TRESTLE_CLIENT_SECRET');
+  // API keys: comma-separated list, e.g. "k1,k2,k3"
+  API_KEYS = '',
 
-  // reuse if > 60s remaining
+  // Optional: tweak selection / enum prettifying
+  PRETTY_ENUMS = 'true'
+} = process.env;
+
+if (!TRESTLE_CLIENT_ID || !TRESTLE_CLIENT_SECRET) {
+  console.error('Missing TRESTLE_CLIENT_ID / TRESTLE_CLIENT_SECRET');
+}
+
+const API_KEY_SET = new Set(
+  API_KEYS
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
+const ODATA_BASE = 'https://api-trestle.corelogic.com/trestle/odata';
+const TOKEN_URL = 'https://api-trestle.corelogic.com/trestle/oidc/connect/token';
+
+/* ------------------------------- CORS setup ------------------------------ */
+// If "*" then allow all (no credentials). Otherwise allow only listed origins.
+let allowed = ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
+const isWildcard = allowed.length === 0 || (allowed.length === 1 && allowed[0] === '*');
+
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // non-browser clients
+    if (isWildcard) return cb(null, true);
+    return cb(null, allowed.includes(origin));
+  },
+  methods: ['GET', 'OPTIONS'],
+  allowedHeaders: ['x-api-key', 'content-type'],
+  maxAge: 86400
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // preflight
+
+/* --------------------------- API key middleware -------------------------- */
+function requireApiKey(req, res, next) {
+  // Allow healthcheck without key
+  if (req.path === '/health') return next();
+
+  const key = req.header('x-api-key');
+  if (!API_KEY_SET.size) {
+    // No keys configured: deny by default to avoid accidental exposure
+    return res.status(401).json({ error: 'API key required' });
+  }
+  if (!key || !API_KEY_SET.has(key)) {
+    return res.status(403).json({ error: 'Invalid API key' });
+  }
+  return next();
+}
+app.use(requireApiKey);
+
+/* -------------------------- Trestle token cache -------------------------- */
+let tokenCache = { access_token: null, expiresAt: 0 };
+
+async function getTrestleToken() {
   const now = Date.now();
-  if (tokenCache.access_token && tokenCache.expires_at - 60_000 > now) {
+  if (tokenCache.access_token && now < tokenCache.expiresAt) {
     return tokenCache.access_token;
   }
 
-  const form = new URLSearchParams();
-  form.set('client_id', client_id);
-  form.set('client_secret', client_secret);
-  form.set('grant_type', 'client_credentials');
-  form.set('scope', TRESTLE_SCOPE);
+  const body = new URLSearchParams();
+  body.set('client_id', TRESTLE_CLIENT_ID);
+  body.set('client_secret', TRESTLE_CLIENT_SECRET);
+  body.set('grant_type', 'client_credentials');
+  body.set('scope', 'api');
 
   const resp = await fetch(TOKEN_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-    body: form
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body
   });
-
-  const text = await resp.text();
-  if (!resp.ok) throw new Error(`Token request failed: ${resp.status} ${resp.statusText} - ${text}`);
-
-  const json = JSON.parse(text);
-  const expiresIn = typeof json.expires_in === 'number' ? json.expires_in : 3600;
-  tokenCache = { access_token: json.access_token, expires_at: Date.now() + expiresIn * 1000 };
-  return json.access_token;
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Token error ${resp.status}: ${text}`);
+  }
+  const json = await resp.json();
+  const ttl = Number(json.expires_in || 28800); // seconds
+  tokenCache = {
+    access_token: json.access_token,
+    // refresh 60s early
+    expiresAt: Date.now() + (ttl - 60) * 1000
+  };
+  return tokenCache.access_token;
 }
 
-// --- Small helpers ---
-const odString = (s) => String(s).replace(/'/g, "''"); // escape single quotes for OData
-
-function toAbsoluteNextLink(link) {
-  if (!link) return null;
-  if (/^https?:\/\//i.test(link)) return link;
-  if (link.startsWith('/')) return `${TRESTLE_HOST}${link}`;
-  return `${TRESTLE_HOST}/${link}`;
-}
-
-async function fetchODataUrl(url, token) {
-  const r = await fetch(url, {
+async function trestleFetch(path, { accept = 'json' } = {}) {
+  const token = await getTrestleToken();
+  const url = path.startsWith('http') ? path : `${ODATA_BASE}${path}`;
+  const resp = await fetch(url, {
     headers: {
       Authorization: `Bearer ${token}`,
-      Accept: 'application/json',
-      'User-Agent': 'IdeasPlusActions/1.0'
+      'User-Agent': 'IDXPlus-CloudRun/1.0'
     }
   });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`OData request failed: ${r.status} ${text}`);
-  return JSON.parse(text);
-}
-
-// Loops @odata.nextLink to aggregate all pages
-async function fetchODataPaged(resource, params) {
-  const token = await fetchAccessToken();
-  const baseUrl = `${TRESTLE_HOST}/trestle/odata/${resource}?${params.toString()}`;
-  const total = [];
-  let url = baseUrl;
-  let count = null;
-
-  while (url) {
-    const page = await fetchODataUrl(url, token);
-    if (count == null && typeof page['@odata.count'] === 'number') count = page['@odata.count'];
-    if (Array.isArray(page.value)) total.push(...page.value);
-    url = toAbsoluteNextLink(page['@odata.nextLink']);
-    if (total.length > 1_000_000) throw new Error('Aborting: >1,000,000 rows accumulated.');
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Trestle ${resp.status}: ${text}`);
   }
-
-  return { count: count ?? total.length, results: total };
+  if (accept === 'xml') return resp.text();
+  return resp.json();
 }
 
-// --- Routes ---
-app.get('/', (_req, res) => res.send('RESO Web API: /auth/token, /webapi/metadata, /webapi/property/by-city'));
+/* --------------------------------- Routes -------------------------------- */
+app.get('/health', (req, res) => {
+  res.set('Cache-Control', 'no-store').json({ ok: true, service: 'IDXPlus Cloud Run' });
+});
 
-app.get('/healthz', (_req, res) => res.json({ ok: true }));
-
-// Token (debug)
-app.get('/auth/token', async (_req, res) => {
+// $metadata (XML)
+app.get('/webapi/metadata', async (req, res) => {
   try {
-    const token = await fetchAccessToken();
-    const ttl = Math.max(0, Math.floor((tokenCache.expires_at - Date.now()) / 1000));
-    res.json({ token_type: 'Bearer', scope: TRESTLE_SCOPE, expires_in: ttl, access_token: token });
+    const xml = await trestleFetch('/$metadata', { accept: 'xml' });
+    res.set('Content-Type', 'application/xml');
+    res.set('Cache-Control', 'public, max-age=600');
+    res.status(200).send(xml);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: String(err.message || err) });
+    res.status(502).json({ error: 'Metadata fetch failed' });
   }
 });
 
-// Metadata (XML)
-app.get('/webapi/metadata', async (_req, res) => {
-  try {
-    const token = await fetchAccessToken();
-    const url = `${TRESTLE_HOST}/trestle/odata/$metadata`;
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/xml' } });
-    const xml = await r.text();
-    if (!r.ok) return res.status(r.status).send(xml);
-    res.type('application/xml').send(xml);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-// --- Simple by-city ---
-// GET /webapi/property/by-city?city=San%20Dimas&top=1000
-// Optional: &osn=CRMLS (overrides MLS_OSN env var)
+// Property by city (gentle on quotas; default last 90 days, Active)
 app.get('/webapi/property/by-city', async (req, res) => {
   try {
-    const city = req.query.city;
-    if (!city) return res.status(400).json({ error: 'city query param is required' });
+    const cityRaw = String(req.query.city || '').trim();
+    if (!cityRaw) return res.status(400).json({ error: 'city is required' });
 
-    const osn = (req.query.osn || DEFAULT_OSN || '').trim(); // strongly recommended by Trestle
-    const top = Math.min(parseInt(req.query.top || '1000', 10), 1000);
+    const top = Math.min(Math.max(parseInt(req.query.top || '100', 10), 1), 1000);
+    const days = Math.min(Math.max(parseInt(req.query.days || '90', 10), 1), 365);
+    const status = String(req.query.status || 'Active').trim();
+
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString(); // UTC
+    const esc = s => s.replace(/'/g, "''"); // OData single-quote escape
+
+    const select = [
+      'ListingKey',
+      'StandardStatus',
+      'City',
+      'PostalCode',
+      'StateOrProvince',
+      'ListPrice',
+      'BedroomsTotal',
+      'BathroomsTotalInteger',
+      'LivingArea',
+      'ModificationTimestamp',
+      'PhotosChangeTimestamp'
+    ].join(',');
+
+    const filter = [
+      `City eq '${esc(cityRaw)}'`,
+      `StandardStatus eq '${esc(status)}'`,
+      `InternetEntireListingDisplayYN eq true`,
+      `ModificationTimestamp ge ${since}`
+    ].join(' and ');
 
     const params = new URLSearchParams();
-    params.set('$count', 'true');
-    params.set('$top', String(top));
-    // keep a minimal, safe select based on your metadata
-    params.set('$select', 'ListingKey,City,StateOrProvince,PostalCode');
-
-    // Build filter
-    let filter = `City eq '${odString(city)}'`;
-    if (osn) filter = `(OriginatingSystemName eq '${odString(osn)}') and ${filter}`;
+    params.set('$select', select);
     params.set('$filter', filter);
+    params.set('$orderby', 'ModificationTimestamp desc');
+    params.set('$top', String(top));
+    if (PRETTY_ENUMS === 'true') params.set('PrettyEnums', 'true');
 
-    const { count, results } = await fetchODataPaged('Property', params);
-    res.json({ query: { city, osn: osn || null, top }, count, listings: results });
+    const data = await trestleFetch(`/Property?${params.toString()}`);
+    const listings = (data.value || []).map(v => ({
+      ListingKey: v.ListingKey,
+      City: v.City,
+      PostalCode: v.PostalCode,
+      StateOrProvince: v.StateOrProvince,
+      StandardStatus: v.StandardStatus,
+      ListPrice: v.ListPrice,
+      BedroomsTotal: v.BedroomsTotal,
+      BathroomsTotalInteger: v.BathroomsTotalInteger,
+      LivingArea: v.LivingArea,
+      ModificationTimestamp: v.ModificationTimestamp,
+      PhotosChangeTimestamp: v.PhotosChangeTimestamp
+    }));
+
+    res.set('Cache-Control', 'private, max-age=30');
+    res.json({
+      city: cityRaw,
+      status,
+      since,
+      returned: listings.length,
+      listings
+    });
   } catch (err) {
-    // Return upstream OData error text to make debugging easier
-    res.status(500).json({ error: String(err.message || err) });
+    console.error(err);
+    res.status(502).json({ error: 'Property query failed' });
   }
 });
 
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+/* --------------------------------- Server -------------------------------- */
+app.listen(PORT, () => {
+  console.log(`Server listening on :${PORT}`);
+});
