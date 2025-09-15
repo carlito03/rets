@@ -1,255 +1,225 @@
 // server.js
-import express from "express";
-import axios from "axios";
-import cors from "cors";
-import qs from "qs";
+// Minimal Cloud Run API with CORS + API key auth for Trestle WebAPI (CommonJS)
 
-const {
-  PORT = 8080,
-  API_KEY,                               // e.g. "k1"
-  ALLOWED_ORIGINS = "",                   // comma-separated, e.g. "https://example.com,null"
-  TRESTLE_CLIENT_ID,
-  TRESTLE_CLIENT_SECRET,
-} = process.env;
-
-if (!API_KEY || !TRESTLE_CLIENT_ID || !TRESTLE_CLIENT_SECRET) {
-  console.error("Missing required env: API_KEY, TRESTLE_CLIENT_ID, TRESTLE_CLIENT_SECRET");
-  process.exit(1);
-}
+const express = require('express');
+const cors = require('cors');
+// Prefer built-in fetch on Node 18+, fall back to node-fetch
+const fetch = global.fetch || ((...args) => import('node-fetch').then(({ default: f }) => f(...args)));
 
 const app = express();
 
-/* ---------- CORS ---------- */
-const allowedOriginsSet = new Set(
-  ALLOWED_ORIGINS
-    .split(",")
+/* -------------------------- Config via env vars -------------------------- */
+const {
+  PORT = 8080,
+
+  // Trestle creds (keep in Secret Manager -> env var)
+  TRESTLE_CLIENT_ID,
+  TRESTLE_CLIENT_SECRET,
+
+  // CORS allowlist: comma-separated, e.g. "https://client1.com,https://client2.com"
+  ALLOWED_ORIGINS = '*',
+
+  // API keys: comma-separated list, e.g. "k1,k2,k3"
+  API_KEYS = '',
+
+  // Optional: tweak selection / enum prettifying
+  PRETTY_ENUMS = 'true'
+} = process.env;
+
+if (!TRESTLE_CLIENT_ID || !TRESTLE_CLIENT_SECRET) {
+  console.error('Missing TRESTLE_CLIENT_ID / TRESTLE_CLIENT_SECRET');
+}
+
+const API_KEY_SET = new Set(
+  API_KEYS
+    .split(',')
     .map(s => s.trim())
     .filter(Boolean)
 );
-// Tip: include "null" to allow local file:// testing
-app.use(cors({
+
+const ODATA_BASE = 'https://api-trestle.corelogic.com/trestle/odata';
+const TOKEN_URL = 'https://api-trestle.corelogic.com/trestle/oidc/connect/token';
+
+/* ------------------------------- CORS setup ------------------------------ */
+// If "*" then allow all (no credentials). Otherwise allow only listed origins.
+let allowed = ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
+const isWildcard = allowed.length === 0 || (allowed.length === 1 && allowed[0] === '*');
+
+const corsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // allow curl / server-to-server
-    if (allowedOriginsSet.has(origin)) return cb(null, true);
-    if (allowedOriginsSet.has("null") && origin === "null") return cb(null, true);
-    return cb(new Error(`CORS blocked for origin: ${origin}`));
+    if (!origin) return cb(null, true); // non-browser clients & curl
+    if (isWildcard) return cb(null, true);
+    return cb(null, allowed.includes(origin));
+  },
+  methods: ['GET', 'OPTIONS'],
+  allowedHeaders: ['x-api-key', 'content-type'],
+  maxAge: 86400
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // preflight
+
+/* --------------------------- API key middleware -------------------------- */
+function requireApiKey(req, res, next) {
+  if (req.path === '/health') return next(); // healthcheck open
+
+  const key = req.header('x-api-key');
+  if (!API_KEY_SET.size) {
+    return res.status(401).json({ error: 'API key required' });
   }
-}));
+  if (!key || !API_KEY_SET.has(key)) {
+    return res.status(403).json({ error: 'Invalid API key' });
+  }
+  return next();
+}
+app.use(requireApiKey);
 
-/* ---------- Simple API key gate ---------- */
-app.use((req, res, next) => {
-  const key = req.header("x-api-key");
-  if (key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
-  next();
-});
+/* -------------------------- Trestle token cache -------------------------- */
+let tokenCache = { access_token: null, expiresAt: 0 };
 
-/* ---------- Trestle auth (cached) ---------- */
-const TOKEN_URL = "https://api-trestle.corelogic.com/trestle/oidc/connect/token";
-const ODATA_BASE = "https://api-trestle.corelogic.com/trestle/odata";
-const UA = "CRMLS-Proxy/1.0 (+by-city)";
-
-let cachedToken = null; // { token, expMs }
-
-async function getToken() {
+async function getTrestleToken() {
   const now = Date.now();
-  if (cachedToken && now < cachedToken.expMs - 60_000) {
-    return cachedToken.token;
+  if (tokenCache.access_token && now < tokenCache.expiresAt) {
+    return tokenCache.access_token;
   }
-  const body = qs.stringify({
-    client_id: TRESTLE_CLIENT_ID,
-    client_secret: TRESTLE_CLIENT_SECRET,
-    grant_type: "client_credentials",
-    scope: "api",
+
+  const body = new URLSearchParams();
+  body.set('client_id', TRESTLE_CLIENT_ID);
+  body.set('client_secret', TRESTLE_CLIENT_SECRET);
+  body.set('grant_type', 'client_credentials');
+  body.set('scope', 'api');
+
+  const resp = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body
   });
-  const resp = await axios.post(TOKEN_URL, body, {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" }
-  });
-  const { access_token, expires_in } = resp.data;
-  cachedToken = {
-    token: access_token,
-    expMs: now + (expires_in * 1000) // usually 8 hours
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Token error ${resp.status}: ${text}`);
+  }
+  const json = await resp.json();
+  const ttl = Number(json.expires_in || 28800); // seconds
+  tokenCache = {
+    access_token: json.access_token,
+    // refresh 60s early
+    expiresAt: Date.now() + (ttl - 60) * 1000
   };
-  return cachedToken.token;
+  return tokenCache.access_token;
 }
 
-/* ---------- Utilities ---------- */
-function escapeODataString(s) {
-  // OData escapes single quotes by doubling them
-  return String(s).replace(/'/g, "''");
-}
-
-function isoDaysAgo(days) {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() - Number(days || 0));
-  // OData v4 accepts ISO8601 without quotes for DateTimeOffset
-  return d.toISOString().replace(/\.\d{3}Z$/, "Z");
-}
-
-function clamp(n, min, max) {
-  n = Number(n ?? 0);
-  if (Number.isNaN(n)) n = min;
-  return Math.max(min, Math.min(n, max));
-}
-
-async function axiosWithAuth(url, params, token) {
-  return axios.get(url, {
+async function trestleFetch(path, { accept = 'json' } = {}) {
+  const token = await getTrestleToken();
+  const url = path.startsWith('http') ? path : `${ODATA_BASE}${path}`;
+  const resp = await fetch(url, {
     headers: {
       Authorization: `Bearer ${token}`,
-      "User-Agent": UA,
-      Accept: "application/json;odata.metadata=minimal"
-    },
-    params
-  });
-}
-
-/* Fetch first MediaURL (primary) for a given listing */
-async function fetchPrimaryPhotoUrl(listingKey, token) {
-  try {
-    const params = {
-      $select: "MediaURL,Order",
-      $filter: `ResourceRecordKey eq '${escapeODataString(listingKey)}'`,
-      $orderby: "Order",
-      $top: 1
-    };
-    const resp = await axiosWithAuth(`${ODATA_BASE}/Media`, params, token);
-    const first = resp.data?.value?.[0];
-    return first?.MediaURL || null;
-  } catch (e) {
-    // If media fails, don't fail the whole request—just return null
-    return null;
-  }
-}
-
-/* Concurrency-limited mapping (keeps media calls gentle) */
-async function mapWithLimit(items, limit, fn) {
-  const out = new Array(items.length);
-  let i = 0;
-  async function worker() {
-    while (i < items.length) {
-      const idx = i++;
-      out[idx] = await fn(items[idx], idx);
+      'User-Agent': 'IDXPlus-CloudRun/1.0'
     }
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Trestle ${resp.status}: ${text}`);
   }
-  const workers = Array.from({ length: limit }, worker);
-  await Promise.all(workers);
-  return out;
+  if (accept === 'xml') return resp.text();
+  return resp.json();
 }
 
-/* ---------- Routes ---------- */
+/* --------------------------------- Routes -------------------------------- */
+app.get('/health', (req, res) => {
+  res.set('Cache-Control', 'no-store').json({ ok: true, service: 'IDXPlus Cloud Run' });
+});
 
-// Health
-app.get("/healthz", (_req, res) => res.json({ ok: true }));
-
-// Metadata passthrough (handy for quick checks)
-app.get("/webapi/metadata", async (_req, res) => {
+// $metadata (XML passthrough)
+app.get('/webapi/metadata', async (req, res) => {
   try {
-    const token = await getToken();
-    const resp = await axios.get(`${ODATA_BASE}/$metadata`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "User-Agent": UA,
-        Accept: "application/xml"
-      }
-    });
-    res.type("application/xml").send(resp.data);
-  } catch (e) {
-    res.status(500).json({ error: "metadata_fetch_failed", detail: e?.response?.data || e.message });
+    const xml = await trestleFetch('/$metadata', { accept: 'xml' });
+    res.set('Content-Type', 'application/xml');
+    res.set('Cache-Control', 'public, max-age=600');
+    res.status(200).send(xml);
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: 'Metadata fetch failed' });
   }
 });
 
-// By-city search (thin listing + primaryPhotoUrl)
-app.get("/webapi/property/by-city", async (req, res) => {
+// Property by city (case-insensitive; default last 90d; Active; includes primaryPhotoUrl via $expand)
+app.get('/webapi/property/by-city', async (req, res) => {
   try {
-    const city = String(req.query.city || "").trim();
-    if (!city) return res.status(400).json({ error: "Missing required query param: city" });
+    const cityRaw = String(req.query.city || '').trim();
+    if (!cityRaw) return res.status(400).json({ error: 'city is required' });
 
-    const top = clamp(req.query.top, 1, 1000);
-    const days = clamp(req.query.days ?? 90, 0, 3650); // default 90
-    const statusParam = (req.query.status || "Active").toString();
-    const includePhoto = (req.query.photo ?? "1") !== "0"; // allow ?photo=0 to skip media calls
+    const top = Math.min(Math.max(parseInt(req.query.top || '100', 10), 1), 1000);
+    const days = Math.min(Math.max(parseInt(req.query.days || '90', 10), 1), 365);
+    const status = String(req.query.status || 'Active').trim();
+    const includePhoto = String(req.query.includePhoto || '1') === '1';
+    const prettyEnums = (req.query.prettyEnums ?? PRETTY_ENUMS) === 'true';
 
-    const token = await getToken();
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString(); // UTC
+    const esc = s => s.replace(/'/g, "''"); // OData single-quote escape
 
-    // Build filter (case-insensitive city; optional status; last-N-days by ModificationTimestamp)
-    const cityLower = city.toLowerCase();
-    const parts = [`tolower(City) eq '${escapeODataString(cityLower)}'`];
+    const select = [
+      'ListingKey',
+      'StandardStatus',
+      'City',
+      'PostalCode',
+      'StateOrProvince',
+      'ListPrice',
+      'BedroomsTotal',
+      'BathroomsTotalInteger',
+      'LivingArea',
+      'ModificationTimestamp',
+      'PhotosChangeTimestamp'
+    ].join(',');
 
-    if (statusParam) {
-      const statuses = statusParam.split(",").map(s => s.trim()).filter(Boolean);
-      if (statuses.length > 1) {
-        parts.push(`StandardStatus in (${statuses.map(s => `'${escapeODataString(s)}'`).join(",")})`);
-      } else if (statuses.length === 1) {
-        parts.push(`StandardStatus eq '${escapeODataString(statuses[0])}'`);
-      }
+    // Case-insensitive match: tolower(City) eq 'san dimas'
+    const filter = [
+      `tolower(City) eq '${esc(cityRaw.toLowerCase())}'`,
+      `StandardStatus eq '${esc(status)}'`,
+      `InternetEntireListingDisplayYN eq true`,
+      `ModificationTimestamp ge ${since}`
+    ].join(' and ');
+
+    const params = new URLSearchParams();
+    params.set('$select', select);
+    params.set('$filter', filter);
+    params.set('$orderby', 'ModificationTimestamp desc');
+    params.set('$top', String(top));
+    if (includePhoto) {
+      params.set('$expand', 'Media($select=MediaURL,Order;$orderby=Order;$top=1)');
     }
+    if (prettyEnums) params.set('PrettyEnums', 'true');
 
-    if (days > 0) {
-      parts.push(`ModificationTimestamp ge ${isoDaysAgo(days)}`);
-    }
-
-    const $filter = parts.join(" and ");
-
-    const $select = [
-      "ListingKey",
-      "City",
-      "PostalCode",
-      "StateOrProvince",
-      "StandardStatus",
-      "ListPrice",
-      "BedroomsTotal",
-      "BathroomsTotalInteger",
-      "LivingArea",
-      "ModificationTimestamp",
-      "PhotosChangeTimestamp"
-    ].join(",");
-
-    const propResp = await axiosWithAuth(`${ODATA_BASE}/Property`, {
-      $select,
-      $filter,
-      $top: top,
-      $count: false
-    }, token);
-
-    let listings = (propResp.data?.value || []).map(row => ({
-      ListingKey: row.ListingKey,
-      City: row.City,
-      PostalCode: row.PostalCode,
-      StateOrProvince: row.StateOrProvince,
-      StandardStatus: row.StandardStatus,
-      ListPrice: row.ListPrice,
-      BedroomsTotal: row.BedroomsTotal,
-      BathroomsTotalInteger: row.BathroomsTotalInteger,
-      LivingArea: row.LivingArea,
-      ModificationTimestamp: row.ModificationTimestamp,
-      PhotosChangeTimestamp: row.PhotosChangeTimestamp,
-      primaryPhotoUrl: null
+    const data = await trestleFetch(`/Property?${params.toString()}`);
+    const listings = (data.value || []).map(v => ({
+      ListingKey: v.ListingKey,
+      City: v.City,
+      PostalCode: v.PostalCode,
+      StateOrProvince: v.StateOrProvince,
+      StandardStatus: v.StandardStatus,
+      ListPrice: v.ListPrice,
+      BedroomsTotal: v.BedroomsTotal,
+      BathroomsTotalInteger: v.BathroomsTotalInteger,
+      LivingArea: v.LivingArea,
+      ModificationTimestamp: v.ModificationTimestamp,
+      PhotosChangeTimestamp: v.PhotosChangeTimestamp,
+      primaryPhotoUrl: Array.isArray(v.Media) && v.Media.length ? v.Media[0].MediaURL : null
     }));
 
-    // Attach primary photo URL (first image) with small concurrency to protect quotas.
-    if (includePhoto && listings.length) {
-      // Limit concurrency to 8; adjust if needed.
-      listings = await mapWithLimit(listings, 8, async (l) => {
-        l.primaryPhotoUrl = await fetchPrimaryPhotoUrl(l.ListingKey, token);
-        return l;
-      });
-    }
-
+    res.set('Cache-Control', 'private, max-age=30');
     res.json({
-      city,
-      count: listings.length,
+      city: cityRaw,
+      status,
+      since,
+      returned: listings.length,
       listings
     });
-  } catch (e) {
-    const status = e?.response?.status || 500;
-    res.status(status).json({
-      error: "by_city_failed",
-      status,
-      detail: e?.response?.data || e.message
-    });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: 'Property query failed' });
   }
 });
 
-/* ---------- Start ---------- */
+/* --------------------------------- Server -------------------------------- */
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
 });
