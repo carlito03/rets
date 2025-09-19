@@ -6,8 +6,10 @@
   "scripts": { "start": "node server.js" },
   "engines": { "node": ">=18" },
   "dependencies": {
-   "cors": "^2.8.5",
-  "express": "^4.19.2",
-  "node-fetch": "^3.3.2"
+    "@aws-sdk/client-dynamodb": "^3.637.0",
+    "@aws-sdk/lib-dynamodb": "^3.637.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2"
   }
 }
