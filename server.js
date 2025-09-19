@@ -8,6 +8,18 @@ const fetch = global.fetch || ((...args) => import('node-fetch').then(({ default
 
 const app = express();
 
+/* -------------------------- AWS -------------------------- */
+
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
+
+const {
+  AWS_REGION = 'us-east-1',
+  DDB_TABLE_LISTINGS = 'Listings'
+} = process.env;
+
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: AWS_REGION }));
+
 /* -------------------------- Config via env vars -------------------------- */
 const {
   PORT = 8080,
@@ -124,6 +136,21 @@ async function trestleFetch(path, { accept = 'json' } = {}) {
   return resp.json();
 }
 
+/* --------------------------------- small helpers -------------------------------- */
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const chunk25 = arr => {
+  const out = [];
+  for (let i = 0; i < arr.length; i += 25) out.push(arr.slice(i, i + 25));
+  return out;
+};
+const normCity = s => (s || '').trim().toLowerCase();
+const toIsoUtc = s => {
+  try { return new Date(s).toISOString(); } catch { return s; }
+};
+
+
+
 /* --------------------------------- Routes -------------------------------- */
 app.get('/health', (req, res) => {
   res.set('Cache-Control', 'no-store').json({ ok: true, service: 'IDXPlus Cloud Run' });
@@ -218,6 +245,118 @@ app.get('/webapi/property/by-city', async (req, res) => {
     res.status(502).json({ error: 'Property query failed' });
   }
 });
+
+// Admin: ingest thin listings for a city into DynamoDB
+app.get('/admin/ingest/city', async (req, res) => {
+  try {
+    const cityRaw = String(req.query.city || '').trim();
+    if (!cityRaw) return res.status(400).json({ error: 'city is required' });
+
+    const days = Math.min(Math.max(parseInt(req.query.days || '90', 10), 1), 365);
+    const status = String(req.query.status || 'Active').trim();
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+    const esc = s => s.replace(/'/g, "''");
+
+    const select = [
+      'ListingKey',
+      'StandardStatus',
+      'City',
+      'PostalCode',
+      'StateOrProvince',
+      'ListPrice',
+      'BedroomsTotal',
+      'BathroomsTotalInteger',
+      'LivingArea',
+      'ModificationTimestamp',
+      'PhotosChangeTimestamp'
+    ].join(',');
+
+    const filter = [
+      `City eq '${esc(cityRaw)}'`,
+      `StandardStatus eq '${esc(status)}'`,
+      `InternetEntireListingDisplayYN eq true`,
+      `ModificationTimestamp ge ${since}`
+    ].join(' and ');
+
+    const baseParams = new URLSearchParams();
+    baseParams.set('$select', select);
+    baseParams.set('$filter', filter);
+    baseParams.set('$orderby', 'ModificationTimestamp desc');
+    baseParams.set('$top', '100');
+    if (PRETTY_ENUMS === 'true') baseParams.set('PrettyEnums', 'true');
+
+    // Pull all pages
+    let url = `/Property?${baseParams.toString()}`;
+    const all = [];
+    let page = 0;
+
+    while (url) {
+      page += 1;
+      const data = await trestleFetch(url);
+      const pageItems = (data.value || []).map(v => ({
+        ListingKey: v.ListingKey,
+        City: v.City,
+        CityNorm: normCity(v.City),
+        PostalCode: v.PostalCode,
+        StateOrProvince: v.StateOrProvince,
+        StandardStatus: v.StandardStatus,
+        ListPrice: v.ListPrice,
+        BedroomsTotal: v.BedroomsTotal,
+        BathroomsTotalInteger: v.BathroomsTotalInteger,
+        LivingArea: v.LivingArea,
+        ModificationTimestamp: toIsoUtc(v.ModificationTimestamp),
+        PhotosChangeTimestamp: toIsoUtc(v.PhotosChangeTimestamp),
+        primaryPhotoUrl: null // minimal version; fill later via media job
+      }));
+      all.push(...pageItems);
+
+      // next page?
+      url = data['@odata.nextLink'] || null;
+      if (url) {
+        // trestleFetch supports absolute nextLink too; be gentle between pages
+        await sleep(150);
+      }
+    }
+
+    // Batch-write to DynamoDB (25 at a time), simple upsert
+    let written = 0;
+    let retries = 0;
+    for (const chunk of chunk25(all)) {
+      let request = {
+        RequestItems: {
+          [DDB_TABLE_LISTINGS]: chunk.map(Item => ({ PutRequest: { Item } }))
+        }
+      };
+
+      // Basic retry for unprocessed items
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const resp = await ddb.send(new BatchWriteCommand(request));
+        const unprocessed = resp.UnprocessedItems?.[DDB_TABLE_LISTINGS] || [];
+        written += (request.RequestItems[DDB_TABLE_LISTINGS].length - unprocessed.length);
+        if (!unprocessed.length) break;
+
+        retries += 1;
+        request = { RequestItems: { [DDB_TABLE_LISTINGS]: unprocessed } };
+        // backoff
+        await sleep(200 * (attempt + 1));
+      }
+    }
+
+    res.set('Cache-Control', 'no-store').json({
+      city: cityRaw,
+      status,
+      since,
+      fetched: all.length,
+      written,
+      retries
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: 'Ingest failed' });
+  }
+});
+
 
 /* --------------------------------- Server -------------------------------- */
 app.listen(PORT, () => {
