@@ -1,4 +1,4 @@
-// ===== PHASE 2 START =====
+// ===== PHASE 2 (fixed) =====
 
 // server.js
 // Minimal Cloud Run API with CORS + API key auth for Trestle WebAPI (CommonJS)
@@ -11,11 +11,8 @@ const fetch = global.fetch || ((...args) => import('node-fetch').then(({ default
 const app = express();
 
 /* -------------------------- AWS -------------------------- */
-
-const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
-const { DescribeTableCommand } = require('@aws-sdk/client-dynamodb');
-
+const { DynamoDBClient, DescribeTableCommand } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, UpdateCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
 
 const {
   AWS_REGION = 'us-east-1',
@@ -47,10 +44,7 @@ if (!TRESTLE_CLIENT_ID || !TRESTLE_CLIENT_SECRET) {
 }
 
 const API_KEY_SET = new Set(
-  API_KEYS
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
+  API_KEYS.split(',').map(s => s.trim()).filter(Boolean)
 );
 
 const ODATA_BASE = 'https://api-trestle.corelogic.com/trestle/odata';
@@ -140,29 +134,14 @@ async function trestleFetch(path, { accept = 'json' } = {}) {
   return resp.json();
 }
 
-/* --------------------------------- small helpers -------------------------------- */
-
+/* --------------------------------- helpers -------------------------------- */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const chunk25 = arr => { // kept (unused for now), handy later
-  const out = [];
-  for (let i = 0; i < arr.length; i += 25) out.push(arr.slice(i, i + 25));
-  return out;
-};
-const toNorm = s => (s || '').trim().toLowerCase();
-const toIsoUtc = s => {
-  try { return new Date(s).toISOString(); } catch { return s; }
-};
+const chunk25 = arr => { const out = []; for (let i = 0; i < arr.length; i += 25) out.push(arr.slice(i, i + 25)); return out; };
+const toNorm = s => String(s || '').trim().toLowerCase();
+const toIsoUtc = s => { try { return new Date(s).toISOString(); } catch { return s; } };
 const toEpoch = iso => Math.floor(new Date(iso || Date.now()).getTime() / 1000);
 
-/* --------------------------------- idempotent upsert -------------------------------- */
-
-// at top (already present in your file):
-const { UpdateCommand } = require('@aws-sdk/lib-dynamodb');
-
-// helper to normalize and epoch-ify (already in your file)
-const toNorm = s => String(s || '').trim().toLowerCase();
-const toEpoch = iso => Math.floor(new Date(iso).getTime() / 1000);
-
+/* ---------------------------- idempotent upsert --------------------------- */
 async function upsertThinListing(item) {
   const {
     ListingKey,
@@ -208,7 +187,7 @@ async function upsertThinListing(item) {
 
   const params = {
     TableName: DDB_TABLE_LISTINGS,
-    Key: { ListingKey },                  // ✅ match table PK
+    Key: { ListingKey }, // match your table PK
     UpdateExpression,
     ConditionExpression: 'attribute_not_exists(ModEpoch) OR ModEpoch <= :ModEpoch',
     ExpressionAttributeValues: {
@@ -221,7 +200,7 @@ async function upsertThinListing(item) {
       ':BedroomsTotal': BedroomsTotal ?? null,
       ':BathroomsTotalInteger': BathroomsTotalInteger ?? null,
       ':LivingArea': LivingArea ?? null,
-      ':ModificationTimestamp': ModificationTimestamp || null,  // ISO string (feeds your GSI)
+      ':ModificationTimestamp': ModificationTimestamp || null,
       ':PhotosChangeTimestamp': PhotosChangeTimestamp || null,
       ':PrimaryPhotoUrl': PrimaryPhotoUrl ?? null,
       ':CityStatus': CityStatus,
@@ -288,7 +267,6 @@ app.get('/webapi/property/by-city', async (req, res) => {
       'PhotosChangeTimestamp'
     ].join(',');
 
-    // Case-insensitive match: tolower(City) eq 'san dimas'
     const filter = [
       `tolower(City) eq '${esc(cityRaw.toLowerCase())}'`,
       `StandardStatus eq '${esc(status)}'`,
@@ -323,13 +301,7 @@ app.get('/webapi/property/by-city', async (req, res) => {
     }));
 
     res.set('Cache-Control', 'private, max-age=30');
-    res.json({
-      city: cityRaw,
-      status,
-      since,
-      returned: listings.length,
-      listings
-    });
+    res.json({ city: cityRaw, status, since, returned: listings.length, listings });
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: 'Property query failed' });
@@ -362,7 +334,6 @@ app.get('/admin/ingest/city', async (req, res) => {
       'PhotosChangeTimestamp'
     ].join(',');
 
-    // Make ingest filter case-insensitive too
     const filter = [
       `tolower(City) eq '${esc(cityRaw.toLowerCase())}'`,
       `StandardStatus eq '${esc(status)}'`,
@@ -380,10 +351,7 @@ app.get('/admin/ingest/city', async (req, res) => {
     // Pull all pages
     let url = `/Property?${baseParams.toString()}`;
     const all = [];
-    let page = 0;
-
     while (url) {
-      page += 1;
       const data = await trestleFetch(url);
       const pageItems = (data.value || []).map(v => ({
         ListingKey: v.ListingKey,
@@ -398,55 +366,37 @@ app.get('/admin/ingest/city', async (req, res) => {
         LivingArea: v.LivingArea,
         ModificationTimestamp: toIsoUtc(v.ModificationTimestamp),
         PhotosChangeTimestamp: toIsoUtc(v.PhotosChangeTimestamp),
-        PrimaryPhotoUrl: null // minimal version; fill later via media job
+        PrimaryPhotoUrl: null // fill later via media job
       }));
       all.push(...pageItems);
 
-      // next page?
       url = data['@odata.nextLink'] || null;
-      if (url) {
-        await sleep(150); // gentle between pages
-      }
+      if (url) await sleep(150);
     }
 
-    // Idempotent upsert per item (tracks written vs skipped)
     let written = 0;
     let skipped = 0;
     for (const it of all) {
       const r = await upsertThinListing(it);
       if (r.skipped) skipped += 1;
       else written += 1;
-
-      // tiny pause to smooth out provisioned capacity (optional)
-      // await sleep(2);
     }
 
     res.set('Cache-Control', 'no-store').json({
-      city: cityRaw,
-      status,
-      since,
-      fetched: all.length,
-      written,
-      skipped
+      city: cityRaw, status, since, fetched: all.length, written, skipped
     });
- } catch (err) {
-  console.error(err);
-  const payload = { error: 'Ingest failed' };
-  if (req.query.debug === '1') {
-    payload.details = { name: err.name, message: err.message };
+  } catch (err) {
+    console.error(err);
+    const payload = { error: 'Ingest failed' };
+    if (req.query.debug === '1') payload.details = { name: err.name, message: err.message };
+    res.status(502).json(payload);
   }
-  res.status(502).json(payload);
-}
 });
 
+// quick DDB ping
 app.get('/admin/ddb/ping', async (req, res) => {
   try {
-    // Describe table to confirm region/name & permissions
-    const meta = await ddb.config.client.send(
-      new DescribeTableCommand({ TableName: DDB_TABLE_LISTINGS })
-    );
-
-    // Try a single tiny write via BatchWrite (same path as ingest)
+    const meta = await ddb.send(new DescribeTableCommand({ TableName: DDB_TABLE_LISTINGS }));
     const item = {
       City: '__ping',
       CityNorm: '__ping',
@@ -463,7 +413,7 @@ app.get('/admin/ddb/ping', async (req, res) => {
       region: AWS_REGION,
       table: DDB_TABLE_LISTINGS,
       status: meta.Table.TableStatus,
-      wroteItem: { pk: item.CityNorm, sk: item.ListingKey }
+      wroteItem: { listingKey: item.ListingKey }
     });
   } catch (err) {
     console.error(err);
@@ -476,8 +426,6 @@ app.get('/admin/ddb/ping', async (req, res) => {
     });
   }
 });
-
-
 
 /* --------------------------------- Server -------------------------------- */
 app.listen(PORT, () => {
