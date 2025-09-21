@@ -156,6 +156,13 @@ const toEpoch = iso => Math.floor(new Date(iso || Date.now()).getTime() / 1000);
 
 /* --------------------------------- idempotent upsert -------------------------------- */
 
+// at top (already present in your file):
+const { UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+
+// helper to normalize and epoch-ify (already in your file)
+const toNorm = s => String(s || '').trim().toLowerCase();
+const toEpoch = iso => Math.floor(new Date(iso).getTime() / 1000);
+
 async function upsertThinListing(item) {
   const {
     ListingKey,
@@ -174,36 +181,39 @@ async function upsertThinListing(item) {
 
   const CityNorm = toNorm(City);
   const CityStatus = `${CityNorm}#${StandardStatus || ''}`;
-  const ModEpoch = toEpoch(ModificationTimestamp);
+  const ModEpoch = toEpoch(ModificationTimestamp || new Date().toISOString());
   const PriceSortDesc = typeof ListPrice === 'number' ? -ListPrice : null;
   const LastSeenAt = Math.floor(Date.now() / 1000);
   const IsActive = StandardStatus === 'Active';
 
+  const UpdateExpression = `
+    SET City = :City,
+        CityNorm = :CityNorm,
+        PostalCode = :PostalCode,
+        StateOrProvince = :StateOrProvince,
+        StandardStatus = :StandardStatus,
+        ListPrice = :ListPrice,
+        BedroomsTotal = :BedroomsTotal,
+        BathroomsTotalInteger = :BathroomsTotalInteger,
+        LivingArea = :LivingArea,
+        ModificationTimestamp = :ModificationTimestamp,
+        PhotosChangeTimestamp = :PhotosChangeTimestamp,
+        PrimaryPhotoUrl = :PrimaryPhotoUrl,
+        CityStatus = :CityStatus,
+        ModEpoch = :ModEpoch,
+        PriceSortDesc = :PriceSortDesc,
+        LastSeenAt = :LastSeenAt,
+        IsActive = :IsActive
+  `.replace(/\s+/g, ' ').trim();
+
   const params = {
     TableName: DDB_TABLE_LISTINGS,
-    Key: { CityNorm, ListingKey },
-    UpdateExpression: `
-      SET City = :City,
-          PostalCode = :PostalCode,
-          StateOrProvince = :StateOrProvince,
-          StandardStatus = :StandardStatus,
-          ListPrice = :ListPrice,
-          BedroomsTotal = :BedroomsTotal,
-          BathroomsTotalInteger = :BathroomsTotalInteger,
-          LivingArea = :LivingArea,
-          ModificationTimestamp = :ModificationTimestamp,
-          PhotosChangeTimestamp = :PhotosChangeTimestamp,
-          PrimaryPhotoUrl = :PrimaryPhotoUrl,
-          CityStatus = :CityStatus,
-          ModEpoch = :ModEpoch,
-          PriceSortDesc = :PriceSortDesc,
-          LastSeenAt = :LastSeenAt,
-          IsActive = :IsActive
-    `.replace(/\s+/g, ' ').trim(),
-    // Only overwrite if this payload is same/newer (by ModEpoch)
+    Key: { ListingKey },                  // ✅ match table PK
+    UpdateExpression,
     ConditionExpression: 'attribute_not_exists(ModEpoch) OR ModEpoch <= :ModEpoch',
     ExpressionAttributeValues: {
-      ':City': City ?? null,
+      ':City': City || null,
+      ':CityNorm': CityNorm,
       ':PostalCode': PostalCode ?? null,
       ':StateOrProvince': StateOrProvince ?? null,
       ':StandardStatus': StandardStatus ?? null,
@@ -211,8 +221,8 @@ async function upsertThinListing(item) {
       ':BedroomsTotal': BedroomsTotal ?? null,
       ':BathroomsTotalInteger': BathroomsTotalInteger ?? null,
       ':LivingArea': LivingArea ?? null,
-      ':ModificationTimestamp': ModificationTimestamp ?? null,
-      ':PhotosChangeTimestamp': PhotosChangeTimestamp ?? null,
+      ':ModificationTimestamp': ModificationTimestamp || null,  // ISO string (feeds your GSI)
+      ':PhotosChangeTimestamp': PhotosChangeTimestamp || null,
       ':PrimaryPhotoUrl': PrimaryPhotoUrl ?? null,
       ':CityStatus': CityStatus,
       ':ModEpoch': ModEpoch,
@@ -226,10 +236,7 @@ async function upsertThinListing(item) {
     await ddb.send(new UpdateCommand(params));
     return { ok: true };
   } catch (e) {
-    if (e.name === 'ConditionalCheckFailedException') {
-      // Older payload — treat as a skip
-      return { ok: true, skipped: true };
-    }
+    if (e.name === 'ConditionalCheckFailedException') return { ok: true, skipped: true };
     throw e;
   }
 }
