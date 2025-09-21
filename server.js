@@ -14,6 +14,8 @@ const app = express();
 
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+const { DescribeTableCommand } = require('@aws-sdk/client-dynamodb');
+
 
 const {
   AWS_REGION = 'us-east-1',
@@ -420,11 +422,54 @@ app.get('/admin/ingest/city', async (req, res) => {
       written,
       skipped
     });
+ } catch (err) {
+  console.error(err);
+  const payload = { error: 'Ingest failed' };
+  if (req.query.debug === '1') {
+    payload.details = { name: err.name, message: err.message };
+  }
+  res.status(502).json(payload);
+}
+});
+
+app.get('/admin/ddb/ping', async (req, res) => {
+  try {
+    // Describe table to confirm region/name & permissions
+    const meta = await ddb.config.client.send(
+      new DescribeTableCommand({ TableName: DDB_TABLE_LISTINGS })
+    );
+
+    // Try a single tiny write via BatchWrite (same path as ingest)
+    const item = {
+      City: '__ping',
+      CityNorm: '__ping',
+      ListingKey: String(Date.now()),
+      StandardStatus: 'Test',
+      ModificationTimestamp: new Date().toISOString()
+    };
+    await ddb.send(new BatchWriteCommand({
+      RequestItems: { [DDB_TABLE_LISTINGS]: [{ PutRequest: { Item: item } }] }
+    }));
+
+    res.json({
+      ok: true,
+      region: AWS_REGION,
+      table: DDB_TABLE_LISTINGS,
+      status: meta.Table.TableStatus,
+      wroteItem: { pk: item.CityNorm, sk: item.ListingKey }
+    });
   } catch (err) {
     console.error(err);
-    res.status(502).json({ error: 'Ingest failed' });
+    res.status(500).json({
+      ok: false,
+      region: AWS_REGION,
+      table: DDB_TABLE_LISTINGS,
+      name: err.name,
+      message: err.message
+    });
   }
 });
+
 
 
 /* --------------------------------- Server -------------------------------- */
