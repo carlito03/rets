@@ -1,3 +1,5 @@
+// ===== PHASE 2 START =====
+
 // server.js
 // Minimal Cloud Run API with CORS + API key auth for Trestle WebAPI (CommonJS)
 
@@ -11,7 +13,7 @@ const app = express();
 /* -------------------------- AWS -------------------------- */
 
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 
 const {
   AWS_REGION = 'us-east-1',
@@ -139,17 +141,96 @@ async function trestleFetch(path, { accept = 'json' } = {}) {
 /* --------------------------------- small helpers -------------------------------- */
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const chunk25 = arr => {
+const chunk25 = arr => { // kept (unused for now), handy later
   const out = [];
   for (let i = 0; i < arr.length; i += 25) out.push(arr.slice(i, i + 25));
   return out;
 };
-const normCity = s => (s || '').trim().toLowerCase();
+const toNorm = s => (s || '').trim().toLowerCase();
 const toIsoUtc = s => {
   try { return new Date(s).toISOString(); } catch { return s; }
 };
+const toEpoch = iso => Math.floor(new Date(iso || Date.now()).getTime() / 1000);
 
+/* --------------------------------- idempotent upsert -------------------------------- */
 
+async function upsertThinListing(item) {
+  const {
+    ListingKey,
+    City,
+    PostalCode,
+    StateOrProvince,
+    StandardStatus,
+    ListPrice,
+    BedroomsTotal,
+    BathroomsTotalInteger,
+    LivingArea,
+    ModificationTimestamp,
+    PhotosChangeTimestamp,
+    PrimaryPhotoUrl
+  } = item;
+
+  const CityNorm = toNorm(City);
+  const CityStatus = `${CityNorm}#${StandardStatus || ''}`;
+  const ModEpoch = toEpoch(ModificationTimestamp);
+  const PriceSortDesc = typeof ListPrice === 'number' ? -ListPrice : null;
+  const LastSeenAt = Math.floor(Date.now() / 1000);
+  const IsActive = StandardStatus === 'Active';
+
+  const params = {
+    TableName: DDB_TABLE_LISTINGS,
+    Key: { CityNorm, ListingKey },
+    UpdateExpression: `
+      SET City = :City,
+          PostalCode = :PostalCode,
+          StateOrProvince = :StateOrProvince,
+          StandardStatus = :StandardStatus,
+          ListPrice = :ListPrice,
+          BedroomsTotal = :BedroomsTotal,
+          BathroomsTotalInteger = :BathroomsTotalInteger,
+          LivingArea = :LivingArea,
+          ModificationTimestamp = :ModificationTimestamp,
+          PhotosChangeTimestamp = :PhotosChangeTimestamp,
+          PrimaryPhotoUrl = :PrimaryPhotoUrl,
+          CityStatus = :CityStatus,
+          ModEpoch = :ModEpoch,
+          PriceSortDesc = :PriceSortDesc,
+          LastSeenAt = :LastSeenAt,
+          IsActive = :IsActive
+    `.replace(/\s+/g, ' ').trim(),
+    // Only overwrite if this payload is same/newer (by ModEpoch)
+    ConditionExpression: 'attribute_not_exists(ModEpoch) OR ModEpoch <= :ModEpoch',
+    ExpressionAttributeValues: {
+      ':City': City ?? null,
+      ':PostalCode': PostalCode ?? null,
+      ':StateOrProvince': StateOrProvince ?? null,
+      ':StandardStatus': StandardStatus ?? null,
+      ':ListPrice': typeof ListPrice === 'number' ? ListPrice : null,
+      ':BedroomsTotal': BedroomsTotal ?? null,
+      ':BathroomsTotalInteger': BathroomsTotalInteger ?? null,
+      ':LivingArea': LivingArea ?? null,
+      ':ModificationTimestamp': ModificationTimestamp ?? null,
+      ':PhotosChangeTimestamp': PhotosChangeTimestamp ?? null,
+      ':PrimaryPhotoUrl': PrimaryPhotoUrl ?? null,
+      ':CityStatus': CityStatus,
+      ':ModEpoch': ModEpoch,
+      ':PriceSortDesc': PriceSortDesc,
+      ':LastSeenAt': LastSeenAt,
+      ':IsActive': IsActive
+    }
+  };
+
+  try {
+    await ddb.send(new UpdateCommand(params));
+    return { ok: true };
+  } catch (e) {
+    if (e.name === 'ConditionalCheckFailedException') {
+      // Older payload — treat as a skip
+      return { ok: true, skipped: true };
+    }
+    throw e;
+  }
+}
 
 /* --------------------------------- Routes -------------------------------- */
 app.get('/health', (req, res) => {
@@ -169,7 +250,7 @@ app.get('/webapi/metadata', async (req, res) => {
   }
 });
 
-// Property by city (case-insensitive; default last 90d; Active; includes primaryPhotoUrl via $expand)
+// Property by city (case-insensitive; default last 90d; Active; includes PrimaryPhotoUrl via $expand)
 app.get('/webapi/property/by-city', async (req, res) => {
   try {
     const cityRaw = String(req.query.city || '').trim();
@@ -229,7 +310,7 @@ app.get('/webapi/property/by-city', async (req, res) => {
       LivingArea: v.LivingArea,
       ModificationTimestamp: v.ModificationTimestamp,
       PhotosChangeTimestamp: v.PhotosChangeTimestamp,
-      primaryPhotoUrl: Array.isArray(v.Media) && v.Media.length ? v.Media[0].MediaURL : null
+      PrimaryPhotoUrl: Array.isArray(v.Media) && v.Media.length ? v.Media[0].MediaURL : null
     }));
 
     res.set('Cache-Control', 'private, max-age=30');
@@ -246,7 +327,7 @@ app.get('/webapi/property/by-city', async (req, res) => {
   }
 });
 
-// Admin: ingest thin listings for a city into DynamoDB
+// Admin: ingest thin listings for a city into DynamoDB (idempotent upsert per item)
 app.get('/admin/ingest/city', async (req, res) => {
   try {
     const cityRaw = String(req.query.city || '').trim();
@@ -272,8 +353,9 @@ app.get('/admin/ingest/city', async (req, res) => {
       'PhotosChangeTimestamp'
     ].join(',');
 
+    // Make ingest filter case-insensitive too
     const filter = [
-      `City eq '${esc(cityRaw)}'`,
+      `tolower(City) eq '${esc(cityRaw.toLowerCase())}'`,
       `StandardStatus eq '${esc(status)}'`,
       `InternetEntireListingDisplayYN eq true`,
       `ModificationTimestamp ge ${since}`
@@ -297,7 +379,7 @@ app.get('/admin/ingest/city', async (req, res) => {
       const pageItems = (data.value || []).map(v => ({
         ListingKey: v.ListingKey,
         City: v.City,
-        CityNorm: normCity(v.City),
+        CityNorm: toNorm(v.City),
         PostalCode: v.PostalCode,
         StateOrProvince: v.StateOrProvince,
         StandardStatus: v.StandardStatus,
@@ -307,40 +389,27 @@ app.get('/admin/ingest/city', async (req, res) => {
         LivingArea: v.LivingArea,
         ModificationTimestamp: toIsoUtc(v.ModificationTimestamp),
         PhotosChangeTimestamp: toIsoUtc(v.PhotosChangeTimestamp),
-        primaryPhotoUrl: null // minimal version; fill later via media job
+        PrimaryPhotoUrl: null // minimal version; fill later via media job
       }));
       all.push(...pageItems);
 
       // next page?
       url = data['@odata.nextLink'] || null;
       if (url) {
-        // trestleFetch supports absolute nextLink too; be gentle between pages
-        await sleep(150);
+        await sleep(150); // gentle between pages
       }
     }
 
-    // Batch-write to DynamoDB (25 at a time), simple upsert
+    // Idempotent upsert per item (tracks written vs skipped)
     let written = 0;
-    let retries = 0;
-    for (const chunk of chunk25(all)) {
-      let request = {
-        RequestItems: {
-          [DDB_TABLE_LISTINGS]: chunk.map(Item => ({ PutRequest: { Item } }))
-        }
-      };
+    let skipped = 0;
+    for (const it of all) {
+      const r = await upsertThinListing(it);
+      if (r.skipped) skipped += 1;
+      else written += 1;
 
-      // Basic retry for unprocessed items
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const resp = await ddb.send(new BatchWriteCommand(request));
-        const unprocessed = resp.UnprocessedItems?.[DDB_TABLE_LISTINGS] || [];
-        written += (request.RequestItems[DDB_TABLE_LISTINGS].length - unprocessed.length);
-        if (!unprocessed.length) break;
-
-        retries += 1;
-        request = { RequestItems: { [DDB_TABLE_LISTINGS]: unprocessed } };
-        // backoff
-        await sleep(200 * (attempt + 1));
-      }
+      // tiny pause to smooth out provisioned capacity (optional)
+      // await sleep(2);
     }
 
     res.set('Cache-Control', 'no-store').json({
@@ -349,7 +418,7 @@ app.get('/admin/ingest/city', async (req, res) => {
       since,
       fetched: all.length,
       written,
-      retries
+      skipped
     });
   } catch (err) {
     console.error(err);
@@ -362,3 +431,5 @@ app.get('/admin/ingest/city', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
 });
+
+// ===== PHASE 2 END =====
