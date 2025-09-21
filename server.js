@@ -10,6 +10,8 @@ const fetch = global.fetch || ((...args) => import('node-fetch').then(({ default
 
 const app = express();
 
+const { QueryCommand } = require('@aws-sdk/lib-dynamodb');
+
 /* -------------------------- AWS -------------------------- */
 const { DynamoDBClient, DescribeTableCommand } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, UpdateCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
@@ -424,6 +426,60 @@ app.get('/admin/ddb/ping', async (req, res) => {
       name: err.name,
       message: err.message
     });
+  }
+});
+
+app.get('/api/search/city', async (req, res) => {
+  try {
+    const city = String(req.query.city || '').trim().toLowerCase();
+    if (!city) return res.status(400).json({ error: 'city is required' });
+
+    const status = String(req.query.status || 'Active').trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10), 1), 100);
+
+    // pagination cursor (opaque)
+    const cursor = req.query.cursor
+      ? JSON.parse(Buffer.from(String(req.query.cursor), 'base64').toString('utf8'))
+      : undefined;
+
+    const params = {
+      TableName: DDB_TABLE_LISTINGS,
+      IndexName: 'CityNorm-ModificationTimestamp-index',
+      KeyConditionExpression: 'CityNorm = :c',
+      FilterExpression: 'StandardStatus = :s',
+      ExpressionAttributeValues: { ':c': city, ':s': status },
+      ScanIndexForward: false,          // newest first (by ModificationTimestamp)
+      Limit: limit,
+      ExclusiveStartKey: cursor
+    };
+
+    const resp = await ddb.send(new QueryCommand(params));
+    const next =
+      resp.LastEvaluatedKey
+        ? Buffer.from(JSON.stringify(resp.LastEvaluatedKey)).toString('base64')
+        : null;
+
+    // map thin fields the UI needs
+    const listings = (resp.Items || []).map(v => ({
+      ListingKey: v.ListingKey,
+      City: v.City,
+      PostalCode: v.PostalCode,
+      StateOrProvince: v.StateOrProvince,
+      StandardStatus: v.StandardStatus,
+      ListPrice: v.ListPrice,
+      BedroomsTotal: v.BedroomsTotal,
+      BathroomsTotalInteger: v.BathroomsTotalInteger,
+      LivingArea: v.LivingArea,
+      ModificationTimestamp: v.ModificationTimestamp,
+      PhotosChangeTimestamp: v.PhotosChangeTimestamp,
+      primaryPhotoUrl: v.PrimaryPhotoUrl ?? null
+    }));
+
+    res.set('Cache-Control', 'private, max-age=15');
+    res.json({ city, status, returned: listings.length, cursor: next, listings });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'search failed' });
   }
 });
 
