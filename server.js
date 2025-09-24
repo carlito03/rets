@@ -15,6 +15,8 @@ const { QueryCommand } = require('@aws-sdk/lib-dynamodb');
 /* -------------------------- AWS -------------------------- */
 const { DynamoDBClient, DescribeTableCommand } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, UpdateCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+
 
 const {
   AWS_REGION = 'us-east-1',
@@ -22,6 +24,27 @@ const {
 } = process.env;
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: AWS_REGION }));
+
+const {
+  MEDIA_BUCKET = 'listings-media-437184912387-use1',
+  CDN_BASE = '' // e.g. https://d1234abcd.cloudfront.net
+} = process.env;
+
+// Prefer standard AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+// If you insist on custom names, we read them explicitly below.
+const accessKeyId =
+  process.env.AWS_ACCESS_KEY_ID || process.env.AWS_SECRET_IMAGE_WRITER_ID;
+const secretAccessKey =
+  process.env.AWS_SECRET_ACCESS_KEY || process.env.IMAGE_WRITER_SECRET;
+
+const s3 = new S3Client({
+  region: AWS_REGION,
+  credentials: (accessKeyId && secretAccessKey)
+    ? { accessKeyId, secretAccessKey }
+    : undefined // falls back to default provider chain if you used standard names
+});
+
+
 
 /* -------------------------- Config via env vars -------------------------- */
 const {
@@ -428,6 +451,37 @@ app.get('/admin/ddb/ping', async (req, res) => {
     });
   }
 });
+
+app.get('/admin/s3/ping', async (req, res) => {
+  try {
+    // 1x1 transparent PNG (base64)
+    const b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/wwAAn8B9C7FQ2UAAAAASUVORK5CYII=';
+    const Body = Buffer.from(b64, 'base64');
+
+    const Key = 'primary/400/ping.png';
+    await s3.send(new PutObjectCommand({
+      Bucket: MEDIA_BUCKET,
+      Key,
+      Body,
+      ContentType: 'image/png',
+      CacheControl: 'public, max-age=31536000, immutable'
+    }));
+
+    const cdn = CDN_BASE || '(set CDN_BASE to your CloudFront URL)';
+    res.json({
+      ok: true,
+      bucket: MEDIA_BUCKET,
+      key: Key,
+      // This is the URL you should be able to open in the browser
+      cdnUrl: CDN_BASE ? `${CDN_BASE}/${Key}` : null,
+      tip: CDN_BASE ? 'Open cdnUrl in your browser' : 'Set CDN_BASE to your CloudFront domain'
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, name: err.name, message: err.message });
+  }
+});
+
 
 app.get('/api/search/city', async (req, res) => {
   try {
