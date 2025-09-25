@@ -498,7 +498,10 @@ app.get('/admin/seed/primary', async (req, res) => {
 // quick DDB ping
 app.get('/admin/ddb/ping', async (req, res) => {
   try {
-    const meta = await ddb.send(new DescribeTableCommand({ TableName: DDB_TABLE_LISTINGS }));
+    const meta = await ddb.config.client.send(
+        new DescribeTableCommand({ TableName: DDB_TABLE_LISTINGS })
+      );
+      
     const item = {
       City: '__ping',
       CityNorm: '__ping',
