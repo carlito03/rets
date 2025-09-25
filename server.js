@@ -1,3 +1,4 @@
+
 // ===== PHASE 2 (fixed) =====
 
 // server.js
@@ -16,6 +17,8 @@ const { QueryCommand } = require('@aws-sdk/lib-dynamodb');
 const { DynamoDBClient, DescribeTableCommand } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, UpdateCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { SQSClient, SendMessageBatchCommand } = require('@aws-sdk/client-sqs');
+
 
 
 const {
@@ -44,6 +47,16 @@ const s3 = new S3Client({
     : undefined // falls back to default provider chain if you used standard names
 });
 
+// SQS queue for image jobs
+const { QUEUE_URL = '' } = process.env;
+
+// Reuse the same credentials pattern as S3
+const sqs = new SQSClient({
+  region: AWS_REGION,
+  credentials: (accessKeyId && secretAccessKey)
+    ? { accessKeyId, secretAccessKey }
+    : undefined
+});
 
 
 /* -------------------------- Config via env vars -------------------------- */
@@ -165,6 +178,35 @@ const chunk25 = arr => { const out = []; for (let i = 0; i < arr.length; i += 25
 const toNorm = s => String(s || '').trim().toLowerCase();
 const toIsoUtc = s => { try { return new Date(s).toISOString(); } catch { return s; } };
 const toEpoch = iso => Math.floor(new Date(iso || Date.now()).getTime() / 1000);
+
+// Enqueue primary-400 image jobs in batches of 10
+async function enqueuePrimaryBatch(listingKeys = []) {
+    if (!QUEUE_URL) throw new Error('QUEUE_URL is not set');
+  
+    let enqueued = 0;
+    for (let i = 0; i < listingKeys.length; i += 10) {
+      const slice = listingKeys.slice(i, i + 10);
+      const Entries = slice.map((key, idx) => ({
+        Id: `${i + idx}`,
+        MessageBody: JSON.stringify({
+          type: 'primary',
+          listingKey: String(key),
+          width: 400
+        })
+      }));
+  
+      const resp = await sqs.send(new SendMessageBatchCommand({
+        QueueUrl: QUEUE_URL,
+        Entries
+      }));
+  
+      enqueued += (Entries.length - (resp.Failed?.length || 0));
+      if (resp.Failed?.length) console.warn('SQS failed entries', resp.Failed);
+      await sleep(50); // gentle
+    }
+    return enqueued;
+  }
+  
 
 /* ---------------------------- idempotent upsert --------------------------- */
 async function upsertThinListing(item) {
@@ -536,6 +578,55 @@ app.get('/api/search/city', async (req, res) => {
     res.status(500).json({ error: 'search failed' });
   }
 });
+
+// Seed SQS with primary-400 image jobs for a city
+app.get('/admin/seed/primary', async (req, res) => {
+    try {
+      const city = String(req.query.city || '').trim().toLowerCase();
+      if (!city) return res.status(400).json({ error: 'city is required' });
+  
+      const status = String(req.query.status || 'Active').trim();
+      const limit = Math.min(Math.max(parseInt(req.query.limit || '200', 10), 1), 500);
+  
+      // pagination cursor (opaque)
+      const cursor = req.query.cursor
+        ? JSON.parse(Buffer.from(String(req.query.cursor), 'base64').toString('utf8'))
+        : undefined;
+  
+      const params = {
+        TableName: DDB_TABLE_LISTINGS,
+        IndexName: 'CityNorm-ModificationTimestamp-index',
+        KeyConditionExpression: 'CityNorm = :c',
+        FilterExpression: 'StandardStatus = :s AND attribute_not_exists(CdnPrimary400)',
+        ExpressionAttributeValues: { ':c': city, ':s': status },
+        ScanIndexForward: false, // newest first
+        Limit: limit,
+        ExclusiveStartKey: cursor
+      };
+  
+      const resp = await ddb.send(new QueryCommand(params));
+      const keys = (resp.Items || []).map(i => i.ListingKey).filter(Boolean);
+  
+      const enqueued = keys.length ? await enqueuePrimaryBatch(keys) : 0;
+      const next =
+        resp.LastEvaluatedKey
+          ? Buffer.from(JSON.stringify(resp.LastEvaluatedKey)).toString('base64')
+          : null;
+  
+      res.json({
+        ok: true,
+        city,
+        status,
+        scanned: resp.Count || 0,
+        enqueued,
+        cursor: next
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ ok: false, error: 'seed failed', name: err.name, message: err.message });
+    }
+  });
+  
 
 /* --------------------------------- Server -------------------------------- */
 app.listen(PORT, () => {
