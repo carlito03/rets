@@ -568,7 +568,7 @@ app.get('/api/search/city', async (req, res) => {
       LivingArea: v.LivingArea,
       ModificationTimestamp: v.ModificationTimestamp,
       PhotosChangeTimestamp: v.PhotosChangeTimestamp,
-      primaryPhotoUrl: v.PrimaryPhotoUrl ?? null
+      primaryPhotoUrl: v.CdnPrimary400 ?? v.PrimaryPhotoUrl ?? null
     }));
 
     res.set('Cache-Control', 'private, max-age=15');
