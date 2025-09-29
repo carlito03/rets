@@ -206,6 +206,34 @@ async function enqueuePrimaryBatch(listingKeys = []) {
     }
     return enqueued;
   }
+
+// --- add below enqueuePrimaryBatch ---
+async function enqueueGalleryBatch(listingKeys = [], per = 10) {
+  if (!QUEUE_URL) throw new Error('QUEUE_URL is not set');
+
+  let enqueued = 0;
+  for (let i = 0; i < listingKeys.length; i += 10) {
+    const slice = listingKeys.slice(i, i + 10);
+    const Entries = slice.map((key, idx) => ({
+      Id: `${i + idx}`,
+      MessageBody: JSON.stringify({
+        type: 'gallery',
+        listingKey: String(key),
+        limit: per
+      }),
+    }));
+
+    const resp = await sqs.send(new SendMessageBatchCommand({
+      QueueUrl: QUEUE_URL,
+      Entries
+    }));
+
+    enqueued += (Entries.length - (resp.Failed?.length || 0));
+    if (resp.Failed?.length) console.warn('SQS failed entries', resp.Failed);
+    await sleep(50);
+  }
+  return enqueued;
+}
   
 
 /* ---------------------------- idempotent upsert --------------------------- */
@@ -576,6 +604,51 @@ app.get('/api/search/city', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'search failed' });
+  }
+});
+
+// Seed SQS with gallery-400 jobs for a city (build up to 10 photos per listing)
+app.get('/admin/seed/gallery', async (req, res) => {
+  try {
+    const city = String(req.query.city || '').trim().toLowerCase();
+    if (!city) return res.status(400).json({ error: 'city is required' });
+
+    const status = String(req.query.status || 'Active').trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '200', 10), 1), 500);
+
+    // how many photos to build per listing (default 10)
+    const per = Math.min(Math.max(parseInt(req.query.per || '10', 10), 1), 20);
+
+    // pagination cursor (opaque)
+    const cursor = req.query.cursor
+      ? JSON.parse(Buffer.from(String(req.query.cursor), 'base64').toString('utf8'))
+      : undefined;
+
+    const params = {
+      TableName: DDB_TABLE_LISTINGS,
+      IndexName: 'CityNorm-ModificationTimestamp-index',
+      KeyConditionExpression: 'CityNorm = :c',
+      // Needs gallery or is stale if photos changed after last image build
+      FilterExpression:
+        'StandardStatus = :s AND (attribute_not_exists(Gallery400) OR PhotosChangeTimestamp > ImagesUpdatedAt)',
+      ExpressionAttributeValues: { ':c': city, ':s': status },
+      ScanIndexForward: false,
+      Limit: limit,
+      ExclusiveStartKey: cursor
+    };
+
+    const resp = await ddb.send(new QueryCommand(params));
+    const keys = (resp.Items || []).map(i => i.ListingKey).filter(Boolean);
+
+    const enqueued = await enqueueGalleryBatch(keys, per);
+    const next = resp.LastEvaluatedKey
+      ? Buffer.from(JSON.stringify(resp.LastEvaluatedKey)).toString('base64')
+      : null;
+
+    res.json({ ok: true, city, status, scanned: (resp.Count || 0), enqueued, cursor: next });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'seed gallery failed', name: err.name, message: err.message });
   }
 });
 
