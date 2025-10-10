@@ -721,6 +721,7 @@ app.get('/admin/seed/gallery', async (req, res) => {
 });
 
 // Detail by ListingKey: cache → else Trestle → cache, plus opportunistic image jobs
+// Detail by ListingKey: cache → else Trestle → cache, plus opportunistic image jobs
 app.get('/webapi/property/by-id', async (req, res) => {
     try {
       const listingKey = String(req.query.listingKey || '').trim();
@@ -734,18 +735,16 @@ app.get('/webapi/property/by-id', async (req, res) => {
       const { Item } = await ddb.send(new GetCommand({
         TableName: DDB_TABLE_LISTINGS,
         Key: { ListingKey: listingKey },
-        // include thin fields we might need to decide on enqueue + gallery count
         ProjectionExpression: [
           'ListingKey','City','StateOrProvince','PostalCode','ListPrice',
           'BedroomsTotal','BathroomsTotalInteger','LivingArea','StandardStatus',
           'PrimaryPhotoUrl','CdnPrimary400','Gallery400Count',
           'PhotosChangeTimestamp','ImagesUpdatedAt',
-          // optional detail cache blob (a Map in DDB because we use the Doc client)
           'Detail','DetailCachedAt'
         ].join(',')
       }));
   
-      // Build CDN gallery array if we know how many exist
+      // Precompute a CDN gallery (if we have a count already)
       const cdnGallery = [];
       if (Item?.Gallery400Count && CDN_BASE) {
         const count = Math.min(Item.Gallery400Count, per || Item.Gallery400Count);
@@ -754,19 +753,20 @@ app.get('/webapi/property/by-id', async (req, res) => {
         }
       }
   
-      // If we have cached detail and not forcing refresh, serve it
+      // ---------------- cache HIT ----------------
       if (Item?.Detail && !force) {
-        // Opportunistic: enqueue image jobs if needed (non-blocking)
+        // opportunistic background jobs (non-blocking)
         (async () => {
           try {
             if (QUEUE_URL) {
-              if (!Item.CdnPrimary400 || isImageStale(Item)) {
+              const stale = isImageStale(Item || {});
+              if (!Item.CdnPrimary400 || stale) {
                 await sqs.send(new SendMessageCommand({
                   QueueUrl: QUEUE_URL,
                   MessageBody: JSON.stringify({ type: 'primary', listingKey, width: 400 })
                 }));
               }
-              if (per > 0 && (isImageStale(Item) || (Item.Gallery400Count || 0) < per)) {
+              if (per > 0 && (stale || (Item.Gallery400Count || 0) < per)) {
                 await sqs.send(new SendMessageCommand({
                   QueueUrl: QUEUE_URL,
                   MessageBody: JSON.stringify({ type: 'gallery', listingKey, width: 400, per })
@@ -778,17 +778,48 @@ app.get('/webapi/property/by-id', async (req, res) => {
           }
         })();
   
+        let galleryOut = cdnGallery;
+        let primaryOut = Item.CdnPrimary400 || Item.PrimaryPhotoUrl || null;
+  
+        // NEW: if caller asked for gallery and we don't have CDN yet, fetch top-N from Trestle now
+        if (per > 0 && cdnGallery.length === 0) {
+          try {
+            const esc = s => s.replace(/'/g, "''");
+            const p = new URLSearchParams();
+            p.set('$filter', `ListingKey eq '${esc(listingKey)}'`);
+            p.set('$select', 'ListingKey,PhotosChangeTimestamp');
+            p.set('$expand', `Media($select=MediaURL,Order,ModificationTimestamp;$orderby=Order;$top=${per})`);
+  
+            const data = await trestleFetch(`/Property?${p.toString()}`);
+            const v = data?.value?.[0];
+            const mediaSrc = Array.isArray(v?.Media) ? v.Media.map(m => m?.MediaURL).filter(Boolean) : [];
+            galleryOut = mediaSrc.slice(0, per);
+            if (!primaryOut) primaryOut = galleryOut[0] || null;
+  
+            // Backfill PrimaryPhotoUrl if missing
+            if (!Item.PrimaryPhotoUrl && galleryOut[0]) {
+              await ddb.send(new UpdateCommand({
+                TableName: DDB_TABLE_LISTINGS,
+                Key: { ListingKey: listingKey },
+                UpdateExpression: 'SET PrimaryPhotoUrl = if_not_exists(PrimaryPhotoUrl, :p)',
+                ExpressionAttributeValues: { ':p': galleryOut[0] }
+              }));
+            }
+          } catch (e) {
+            console.warn('fallback trestle media failed', e?.message || e);
+          }
+        }
+  
         return res.set('Cache-Control', 'private, max-age=15').json({
           cache: 'hit',
           listingKey,
-          property: Item.Detail,     // full cached detail (DDB document)
-          primary: Item.CdnPrimary400 || Item.PrimaryPhotoUrl || null,
-          gallery: cdnGallery        // CDN gallery (if any we know about)
+          property: Item.Detail,
+          primary: primaryOut,
+          gallery: galleryOut
         });
       }
   
-      // 2) Cache miss or forced refresh → fetch from Trestle
-      // Select a useful set of fields for the detail page (trim or expand as you like)
+      // ---------------- cache MISS or forced refresh ----------------
       const select = [
         'ListingKey','ListingId','StandardStatus',
         'UnparsedAddress','StreetNumber','StreetNumberNumeric','StreetDirPrefix','StreetName','StreetSuffix','UnitNumber',
@@ -811,7 +842,6 @@ app.get('/webapi/property/by-id', async (req, res) => {
       const v = (data.value || [])[0];
       if (!v) return res.status(404).json({ error: 'not found' });
   
-      // Normalize a minimal detail object we’ll cache and return
       const detail = {
         ListingKey: v.ListingKey,
         ListingId: v.ListingId ?? null,
@@ -843,11 +873,9 @@ app.get('/webapi/property/by-id', async (req, res) => {
         PhotosChangeTimestamp: v.PhotosChangeTimestamp ?? null
       };
   
-      // Source media (from Trestle) we may return for this request, and use to seed jobs
       const mediaSrc = Array.isArray(v.Media) ? v.Media.map(m => m?.MediaURL).filter(Boolean) : [];
       const primarySrc = mediaSrc[0] || null;
   
-      // 3) Write back to cache (DDB). Also backfill PrimaryPhotoUrl if missing.
       await ddb.send(new UpdateCommand({
         TableName: DDB_TABLE_LISTINGS,
         Key: { ListingKey: listingKey },
@@ -865,11 +893,11 @@ app.get('/webapi/property/by-id', async (req, res) => {
         }
       }));
   
-      // 4) Opportunistic: enqueue image jobs if needed
+      // opportunistic jobs
       (async () => {
         try {
           if (QUEUE_URL) {
-            const stale = isImageStale(Item || {}); // Item may be undefined on first-ever miss
+            const stale = isImageStale(Item || {});
             if (!Item?.CdnPrimary400 || stale) {
               await sqs.send(new SendMessageCommand({
                 QueueUrl: QUEUE_URL,
@@ -888,15 +916,12 @@ app.get('/webapi/property/by-id', async (req, res) => {
         }
       })();
   
-      // 5) Response: prefer CDN gallery if we already knew count; otherwise return source URLs for this request
-      const galleryOut = cdnGallery.length ? cdnGallery : mediaSrc.slice(0, per);
-  
       res.set('Cache-Control', 'private, max-age=15').json({
         cache: 'miss',
         listingKey,
         property: detail,
         primary: (Item?.CdnPrimary400 || Item?.PrimaryPhotoUrl || null) ?? primarySrc,
-        gallery: galleryOut
+        gallery: mediaSrc.slice(0, per)
       });
     } catch (err) {
       console.error(err);
