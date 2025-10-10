@@ -1,4 +1,3 @@
-
 // ===== PHASE 2 (fixed) =====
 
 // server.js
@@ -18,8 +17,6 @@ const { DynamoDBClient, DescribeTableCommand } = require('@aws-sdk/client-dynamo
 const { DynamoDBDocumentClient, UpdateCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { SQSClient, SendMessageBatchCommand } = require('@aws-sdk/client-sqs');
-
-
 
 const {
   AWS_REGION = 'us-east-1',
@@ -58,7 +55,6 @@ const sqs = new SQSClient({
     : undefined
 });
 
-
 /* -------------------------- Config via env vars -------------------------- */
 const {
   PORT = 8080,
@@ -89,7 +85,6 @@ const ODATA_BASE = 'https://api-trestle.corelogic.com/trestle/odata';
 const TOKEN_URL = 'https://api-trestle.corelogic.com/trestle/oidc/connect/token';
 
 /* ------------------------------- CORS setup ------------------------------ */
-// If "*" then allow all (no credentials). Otherwise allow only listed origins.
 let allowed = ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
 const isWildcard = allowed.length === 0 || (allowed.length === 1 && allowed[0] === '*');
 
@@ -111,12 +106,8 @@ function requireApiKey(req, res, next) {
   if (req.path === '/health') return next(); // healthcheck open
 
   const key = req.header('x-api-key');
-  if (!API_KEY_SET.size) {
-    return res.status(401).json({ error: 'API key required' });
-  }
-  if (!key || !API_KEY_SET.has(key)) {
-    return res.status(403).json({ error: 'Invalid API key' });
-  }
+  if (!API_KEY_SET.size) return res.status(401).json({ error: 'API key required' });
+  if (!key || !API_KEY_SET.has(key)) return res.status(403).json({ error: 'Invalid API key' });
   return next();
 }
 app.use(requireApiKey);
@@ -149,8 +140,7 @@ async function getTrestleToken() {
   const ttl = Number(json.expires_in || 28800); // seconds
   tokenCache = {
     access_token: json.access_token,
-    // refresh 60s early
-    expiresAt: Date.now() + (ttl - 60) * 1000
+    expiresAt: Date.now() + (ttl - 60) * 1000 // refresh 60s early
   };
   return tokenCache.access_token;
 }
@@ -181,31 +171,23 @@ const toEpoch = iso => Math.floor(new Date(iso || Date.now()).getTime() / 1000);
 
 // Enqueue primary-400 image jobs in batches of 10
 async function enqueuePrimaryBatch(listingKeys = []) {
-    if (!QUEUE_URL) throw new Error('QUEUE_URL is not set');
-  
-    let enqueued = 0;
-    for (let i = 0; i < listingKeys.length; i += 10) {
-      const slice = listingKeys.slice(i, i + 10);
-      const Entries = slice.map((key, idx) => ({
-        Id: `${i + idx}`,
-        MessageBody: JSON.stringify({
-          type: 'primary',
-          listingKey: String(key),
-          width: 400
-        })
-      }));
-  
-      const resp = await sqs.send(new SendMessageBatchCommand({
-        QueueUrl: QUEUE_URL,
-        Entries
-      }));
-  
-      enqueued += (Entries.length - (resp.Failed?.length || 0));
-      if (resp.Failed?.length) console.warn('SQS failed entries', resp.Failed);
-      await sleep(50); // gentle
-    }
-    return enqueued;
+  if (!QUEUE_URL) throw new Error('QUEUE_URL is not set');
+
+  let enqueued = 0;
+  for (let i = 0; i < listingKeys.length; i += 10) {
+    const slice = listingKeys.slice(i, i + 10);
+    const Entries = slice.map((key, idx) => ({
+      Id: `${i + idx}`,
+      MessageBody: JSON.stringify({ type: 'primary', listingKey: String(key), width: 400 })
+    }));
+
+    const resp = await sqs.send(new SendMessageBatchCommand({ QueueUrl: QUEUE_URL, Entries }));
+    enqueued += (Entries.length - (resp.Failed?.length || 0));
+    if (resp.Failed?.length) console.warn('SQS failed entries', resp.Failed);
+    await sleep(50);
   }
+  return enqueued;
+}
 
 // --- add below enqueuePrimaryBatch ---
 async function enqueueGalleryBatch(listingKeys = [], per = 10) {
@@ -216,25 +198,16 @@ async function enqueueGalleryBatch(listingKeys = [], per = 10) {
     const slice = listingKeys.slice(i, i + 10);
     const Entries = slice.map((key, idx) => ({
       Id: `${i + idx}`,
-      MessageBody: JSON.stringify({
-        type: 'gallery',
-        listingKey: String(key),
-        limit: per
-      }),
+      MessageBody: JSON.stringify({ type: 'gallery', listingKey: String(key), limit: per }),
     }));
 
-    const resp = await sqs.send(new SendMessageBatchCommand({
-      QueueUrl: QUEUE_URL,
-      Entries
-    }));
-
+    const resp = await sqs.send(new SendMessageBatchCommand({ QueueUrl: QUEUE_URL, Entries }));
     enqueued += (Entries.length - (resp.Failed?.length || 0));
     if (resp.Failed?.length) console.warn('SQS failed entries', resp.Failed);
     await sleep(50);
   }
   return enqueued;
 }
-  
 
 /* ---------------------------- idempotent upsert --------------------------- */
 async function upsertThinListing(item) {
@@ -250,7 +223,10 @@ async function upsertThinListing(item) {
     LivingArea,
     ModificationTimestamp,
     PhotosChangeTimestamp,
-    PrimaryPhotoUrl
+    PrimaryPhotoUrl,
+    // NEW (address fields)
+    UnparsedAddress,
+    InternetAddressDisplayYN
   } = item;
 
   const CityNorm = toNorm(City);
@@ -277,7 +253,9 @@ async function upsertThinListing(item) {
         ModEpoch = :ModEpoch,
         PriceSortDesc = :PriceSortDesc,
         LastSeenAt = :LastSeenAt,
-        IsActive = :IsActive
+        IsActive = :IsActive,
+        UnparsedAddress = :UnparsedAddress,
+        InternetAddressDisplayYN = :InternetAddressDisplayYN
   `.replace(/\s+/g, ' ').trim();
 
   const params = {
@@ -302,7 +280,10 @@ async function upsertThinListing(item) {
       ':ModEpoch': ModEpoch,
       ':PriceSortDesc': PriceSortDesc,
       ':LastSeenAt': LastSeenAt,
-      ':IsActive': IsActive
+      ':IsActive': IsActive,
+      // NEW values
+      ':UnparsedAddress': UnparsedAddress ?? null,
+      ':InternetAddressDisplayYN': (typeof InternetAddressDisplayYN === 'boolean') ? InternetAddressDisplayYN : null
     }
   };
 
@@ -359,7 +340,10 @@ app.get('/webapi/property/by-city', async (req, res) => {
       'BathroomsTotalInteger',
       'LivingArea',
       'ModificationTimestamp',
-      'PhotosChangeTimestamp'
+      'PhotosChangeTimestamp',
+      // NEW address fields
+      'UnparsedAddress',
+      'InternetAddressDisplayYN'
     ].join(',');
 
     const filter = [
@@ -392,6 +376,8 @@ app.get('/webapi/property/by-city', async (req, res) => {
       LivingArea: v.LivingArea,
       ModificationTimestamp: v.ModificationTimestamp,
       PhotosChangeTimestamp: v.PhotosChangeTimestamp,
+      // NEW: respect address display
+      address: (v.InternetAddressDisplayYN === false) ? null : v.UnparsedAddress ?? null,
       PrimaryPhotoUrl: Array.isArray(v.Media) && v.Media.length ? v.Media[0].MediaURL : null
     }));
 
@@ -426,7 +412,10 @@ app.get('/admin/ingest/city', async (req, res) => {
       'BathroomsTotalInteger',
       'LivingArea',
       'ModificationTimestamp',
-      'PhotosChangeTimestamp'
+      'PhotosChangeTimestamp',
+      // NEW address fields
+      'UnparsedAddress',
+      'InternetAddressDisplayYN'
     ].join(',');
 
     const filter = [
@@ -461,6 +450,9 @@ app.get('/admin/ingest/city', async (req, res) => {
         LivingArea: v.LivingArea,
         ModificationTimestamp: toIsoUtc(v.ModificationTimestamp),
         PhotosChangeTimestamp: toIsoUtc(v.PhotosChangeTimestamp),
+        // NEW: store null if address display is disallowed
+        UnparsedAddress: (v.InternetAddressDisplayYN === false) ? null : (v.UnparsedAddress ?? null),
+        InternetAddressDisplayYN: v.InternetAddressDisplayYN ?? null,
         PrimaryPhotoUrl: null // fill later via media job
       }));
       all.push(...pageItems);
@@ -542,7 +534,6 @@ app.get('/admin/s3/ping', async (req, res) => {
       ok: true,
       bucket: MEDIA_BUCKET,
       key: Key,
-      // This is the URL you should be able to open in the browser
       cdnUrl: CDN_BASE ? `${CDN_BASE}/${Key}` : null,
       tip: CDN_BASE ? 'Open cdnUrl in your browser' : 'Set CDN_BASE to your CloudFront domain'
     });
@@ -551,7 +542,6 @@ app.get('/admin/s3/ping', async (req, res) => {
     res.status(500).json({ ok: false, name: err.name, message: err.message });
   }
 });
-
 
 app.get('/api/search/city', async (req, res) => {
   try {
@@ -596,6 +586,8 @@ app.get('/api/search/city', async (req, res) => {
       LivingArea: v.LivingArea,
       ModificationTimestamp: v.ModificationTimestamp,
       PhotosChangeTimestamp: v.PhotosChangeTimestamp,
+      // NEW: expose address only if allowed
+      address: (v.InternetAddressDisplayYN === false) ? null : (v.UnparsedAddress ?? null),
       primaryPhotoUrl: v.CdnPrimary400 ?? v.PrimaryPhotoUrl ?? null
     }));
 
@@ -654,52 +646,51 @@ app.get('/admin/seed/gallery', async (req, res) => {
 
 // Seed SQS with primary-400 image jobs for a city
 app.get('/admin/seed/primary', async (req, res) => {
-    try {
-      const city = String(req.query.city || '').trim().toLowerCase();
-      if (!city) return res.status(400).json({ error: 'city is required' });
-  
-      const status = String(req.query.status || 'Active').trim();
-      const limit = Math.min(Math.max(parseInt(req.query.limit || '200', 10), 1), 500);
-  
-      // pagination cursor (opaque)
-      const cursor = req.query.cursor
-        ? JSON.parse(Buffer.from(String(req.query.cursor), 'base64').toString('utf8'))
-        : undefined;
-  
-      const params = {
-        TableName: DDB_TABLE_LISTINGS,
-        IndexName: 'CityNorm-ModificationTimestamp-index',
-        KeyConditionExpression: 'CityNorm = :c',
-        FilterExpression: 'StandardStatus = :s AND attribute_not_exists(CdnPrimary400)',
-        ExpressionAttributeValues: { ':c': city, ':s': status },
-        ScanIndexForward: false, // newest first
-        Limit: limit,
-        ExclusiveStartKey: cursor
-      };
-  
-      const resp = await ddb.send(new QueryCommand(params));
-      const keys = (resp.Items || []).map(i => i.ListingKey).filter(Boolean);
-  
-      const enqueued = keys.length ? await enqueuePrimaryBatch(keys) : 0;
-      const next =
-        resp.LastEvaluatedKey
-          ? Buffer.from(JSON.stringify(resp.LastEvaluatedKey)).toString('base64')
-          : null;
-  
-      res.json({
-        ok: true,
-        city,
-        status,
-        scanned: resp.Count || 0,
-        enqueued,
-        cursor: next
-      });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ ok: false, error: 'seed failed', name: err.name, message: err.message });
-    }
-  });
-  
+  try {
+    const city = String(req.query.city || '').trim().toLowerCase();
+    if (!city) return res.status(400).json({ error: 'city is required' });
+
+    const status = String(req.query.status || 'Active').trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '200', 10), 1), 500);
+
+    // pagination cursor (opaque)
+    const cursor = req.query.cursor
+      ? JSON.parse(Buffer.from(String(req.query.cursor), 'base64').toString('utf8'))
+      : undefined;
+
+    const params = {
+      TableName: DDB_TABLE_LISTINGS,
+      IndexName: 'CityNorm-ModificationTimestamp-index',
+      KeyConditionExpression: 'CityNorm = :c',
+      FilterExpression: 'StandardStatus = :s AND attribute_not_exists(CdnPrimary400)',
+      ExpressionAttributeValues: { ':c': city, ':s': status },
+      ScanIndexForward: false, // newest first
+      Limit: limit,
+      ExclusiveStartKey: cursor
+    };
+
+    const resp = await ddb.send(new QueryCommand(params));
+    const keys = (resp.Items || []).map(i => i.ListingKey).filter(Boolean);
+
+    const enqueued = keys.length ? await enqueuePrimaryBatch(keys) : 0;
+    const next =
+      resp.LastEvaluatedKey
+        ? Buffer.from(JSON.stringify(resp.LastEvaluatedKey)).toString('base64')
+        : null;
+
+    res.json({
+      ok: true,
+      city,
+      status,
+      scanned: resp.Count || 0,
+      enqueued,
+      cursor: next
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: 'seed failed', name: err.name, message: err.message });
+  }
+});
 
 /* --------------------------------- Server -------------------------------- */
 app.listen(PORT, () => {
