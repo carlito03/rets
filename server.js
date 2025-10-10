@@ -653,72 +653,106 @@ app.get('/api/search/city', async (req, res) => {
 
 // Fetch full details + top-N media from Trestle NOW,
 // store a compact "Details" snapshot in Dynamo for next time.
+// Fetch full details + top-N media from Trestle now,
+// then store a compact "Details" snapshot in Dynamo for next time.
 app.get('/webapi/property/by-id', async (req, res) => {
-    try {
-      const listingKey = String(req.query.listingKey || '').trim();
-      if (!listingKey) return res.status(400).json({ error: 'listingKey is required' });
-  
-      const galleryN = Math.min(Math.max(parseInt(req.query.gallery || '10', 10), 1), 50);
-  
-      // Build OData query
-      const esc = s => s.replace(/'/g, "''");
-      const select = [
-        'ListingKey','StandardStatus','PropertyType','PropertySubType',
-        'UnparsedAddress','StreetNumber','StreetDirPrefix','StreetName','StreetSuffix','UnitNumber',
-        'City','StateOrProvince','PostalCode',
-        'Latitude','Longitude',
-        'ListPrice','BedroomsTotal','BathroomsTotalInteger','LivingArea','YearBuilt','LotSizeAcres','StoriesTotal',
-        'Cooling','Heating','PublicRemarks',
-        'ModificationTimestamp','PhotosChangeTimestamp'
-      ].join(',');
-  
-      const q = new URLSearchParams();
-      q.set('$filter', `ListingKey eq '${esc(listingKey)}'`);
-      q.set('$select', select);
-      q.set('$expand', `Media($select=MediaURL,Order,ModificationTimestamp;$orderby=Order;$top=${galleryN})`);
-  
-      const data = await trestleFetch(`/Property?${q.toString()}`);
-      const v = data?.value?.[0];
-      if (!v) return res.status(404).json({ error: 'Listing not found in Trestle' });
-  
-      const detail = shapeDetails(v);
-      const gallery = shapeGallery(v.Media, galleryN);
-  
-      // Save a compact snapshot alongside your thin row
-      const nowIso = new Date().toISOString();
-      await ddb.send(new UpdateCommand({
-        TableName: DDB_TABLE_LISTINGS,
-        Key: { ListingKey: String(listingKey) },
-        UpdateExpression: `
-          SET Details = :d,
-              DetailsUpdatedAt = :t,
-              PhotosChangeTimestamp = if_not_exists(PhotosChangeTimestamp, :pct) -- keep latest we saw
-        `.replace(/\s+/g, ' ').trim(),
-        ExpressionAttributeValues: {
-          ':d': { ...detail, GalleryTopN: gallery.map(g => g.url) },
-          ':t': nowIso,
-          ':pct': detail.PhotosChangeTimestamp ?? null
-        }
-      }));
-  
-      // Build primary URL preference: CDN if we have it, else first media
-      const primaryFromCdn = req.query.preferCdn !== '0' ? (req.query.cdn || null) : null; // optional override
-      const cdnPrimary = undefined; // you can look up v from DDB if you want
-      const primary = cdnPrimary || (gallery[0]?.url ?? null);
-  
-      res.set('Cache-Control', 'private, max-age=30');
-      res.json({
-        servedFrom: 'trestle',
-        listingKey,
-        primaryPhotoUrl: primary,
-        gallery,                 // array of {url, order} (Trestle direct urls)
-        details: detail          // normalized detail payload
-      });
-    } catch (err) {
-      console.error(err);
-      res.status(502).json({ error: 'detail fetch failed', message: err.message });
-    }
-  });
+  try {
+    const listingKey = String(req.query.listingKey || '').trim();
+    if (!listingKey) return res.status(400).json({ error: 'listingKey is required' });
+
+    const galleryN = Math.min(Math.max(parseInt(req.query.gallery || '10', 10), 1), 50);
+
+    // Build OData query
+    const esc = s => s.replace(/'/g, "''");
+    const select = [
+      'ListingKey','StandardStatus','PropertyType','PropertySubType',
+      'UnparsedAddress','StreetNumber','StreetDirPrefix','StreetName','StreetSuffix','UnitNumber',
+      'City','StateOrProvince','PostalCode',
+      'Latitude','Longitude',
+      'ListPrice','BedroomsTotal','BathroomsTotalInteger','LivingArea','YearBuilt','LotSizeAcres','StoriesTotal',
+      'Cooling','Heating','PublicRemarks',
+      'ModificationTimestamp','PhotosChangeTimestamp'
+    ].join(',');
+
+    const q = new URLSearchParams();
+    q.set('$filter', `ListingKey eq '${esc(listingKey)}'`);
+    q.set('$select', select);
+    q.set('$expand', `Media($select=MediaURL,Order,ModificationTimestamp;$orderby=Order;$top=${galleryN})`);
+
+    const data = await trestleFetch(`/Property?${q.toString()}`);
+    const v = data?.value?.[0];
+    if (!v) return res.status(404).json({ error: 'Listing not found in Trestle' });
+
+    // shape helpers (same as I sent before)
+    const detail = {
+      ListingKey: v.ListingKey,
+      StandardStatus: v.StandardStatus,
+      PropertyType: v.PropertyType ?? null,
+      PropertySubType: v.PropertySubType ?? null,
+      UnparsedAddress: v.UnparsedAddress ?? null,
+      StreetNumber: v.StreetNumber ?? null,
+      StreetDirPrefix: v.StreetDirPrefix ?? null,
+      StreetName: v.StreetName ?? null,
+      StreetSuffix: v.StreetSuffix ?? null,
+      UnitNumber: v.UnitNumber ?? null,
+      City: v.City ?? null,
+      StateOrProvince: v.StateOrProvince ?? null,
+      PostalCode: v.PostalCode ?? null,
+      Latitude: v.Latitude ?? null,
+      Longitude: v.Longitude ?? null,
+      ListPrice: v.ListPrice ?? null,
+      BedroomsTotal: v.BedroomsTotal ?? null,
+      BathroomsTotalInteger: v.BathroomsTotalInteger ?? null,
+      LivingArea: v.LivingArea ?? null,
+      YearBuilt: v.YearBuilt ?? null,
+      LotSizeAcres: v.LotSizeAcres ?? null,
+      StoriesTotal: v.StoriesTotal ?? null,
+      Cooling: v.Cooling ?? null,
+      Heating: v.Heating ?? null,
+      PublicRemarks: v.PublicRemarks ?? null,
+      ModificationTimestamp: v.ModificationTimestamp ?? null,
+      PhotosChangeTimestamp: v.PhotosChangeTimestamp ?? null
+    };
+
+    const gallery = (Array.isArray(v.Media) ? v.Media : [])
+      .slice(0, galleryN)
+      .filter(m => !!m?.MediaURL)
+      .sort((a, b) => (a.Order ?? 0) - (b.Order ?? 0))
+      .map(m => ({ url: m.MediaURL, order: m.Order ?? null }));
+
+    // Save compact snapshot + the top-N gallery URLs for quick reuse
+    const nowIso = new Date().toISOString();
+    await ddb.send(new UpdateCommand({
+      TableName: DDB_TABLE_LISTINGS,
+      Key: { ListingKey: String(listingKey) },
+      UpdateExpression: 'SET #Details = :d, #DetailsUpdatedAt = :t, PhotosChangeTimestamp = if_not_exists(PhotosChangeTimestamp, :pct)',
+      ExpressionAttributeNames: {
+        '#Details': 'Details',
+        '#DetailsUpdatedAt': 'DetailsUpdatedAt'
+      },
+      ExpressionAttributeValues: {
+        ':d': { ...detail, GalleryTopN: gallery.map(g => g.url) },
+        ':t': nowIso,
+        ':pct': detail.PhotosChangeTimestamp ?? null
+      }
+    }));
+
+    // Prefer existing CDN primary if you already have it; else first gallery URL
+    const primary = gallery[0]?.url ?? null;
+
+    res.set('Cache-Control', 'private, max-age=30');
+    res.json({
+      servedFrom: 'trestle',
+      listingKey,
+      primaryPhotoUrl: primary,
+      gallery,
+      details: detail
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: 'detail fetch failed', message: err.message });
+  }
+});
 
 // Seed SQS with gallery-400 jobs for a city (build up to 10 photos per listing)
 app.get('/admin/seed/gallery', async (req, res) => {
