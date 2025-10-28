@@ -243,7 +243,9 @@ async function upsertThinListing(item) {
     PrimaryPhotoUrl,
     // NEW (address fields)
     UnparsedAddress,
-    InternetAddressDisplayYN
+    InternetAddressDisplayYN,
+    // NEW: special listing conditions (array of strings)
+    SpecialListingConditions
   } = item;
 
   const CityNorm = toNorm(City);
@@ -272,7 +274,8 @@ async function upsertThinListing(item) {
         LastSeenAt = :LastSeenAt,
         IsActive = :IsActive,
         UnparsedAddress = :UnparsedAddress,
-        InternetAddressDisplayYN = :InternetAddressDisplayYN
+        InternetAddressDisplayYN = :InternetAddressDisplayYN,
+        SpecialListingConditions = :SpecialListingConditions
   `.replace(/\s+/g, ' ').trim();
 
   const params = {
@@ -300,7 +303,9 @@ async function upsertThinListing(item) {
       ':IsActive': IsActive,
       // NEW values
       ':UnparsedAddress': UnparsedAddress ?? null,
-      ':InternetAddressDisplayYN': (typeof InternetAddressDisplayYN === 'boolean') ? InternetAddressDisplayYN : null
+      ':InternetAddressDisplayYN': (typeof InternetAddressDisplayYN === 'boolean') ? InternetAddressDisplayYN : null,
+      // store as an array (DocumentClient maps JS array -> DDB List)
+    ':SpecialListingConditions': Array.isArray(SpecialListingConditions) ? SpecialListingConditions : []
     }
   };
 
@@ -466,6 +471,11 @@ app.get('/admin/ingest/city', async (req, res) => {
 
     const days = Math.min(Math.max(parseInt(req.query.days || '90', 10), 1), 365);
     const status = String(req.query.status || 'Active').trim();
+
+// NEW: Optional special-listing-conditions filter. Supports comma-separated.
+const slcRaw = String(req.query.slc || '').trim();
+const slcList = slcRaw ? slcRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
     const esc = s => s.replace(/'/g, "''");
@@ -484,15 +494,26 @@ app.get('/admin/ingest/city', async (req, res) => {
       'PhotosChangeTimestamp',
       // NEW address fields
       'UnparsedAddress',
-      'InternetAddressDisplayYN'
+      'InternetAddressDisplayYN',
+      'SpecialListingConditions'
     ].join(',');
 
-    const filter = [
+    const filterParts = [
       `tolower(City) eq '${esc(cityRaw.toLowerCase())}'`,
       `StandardStatus eq '${esc(status)}'`,
       `InternetEntireListingDisplayYN eq true`,
       `ModificationTimestamp ge ${since}`
-    ].join(' and ');
+    
+];
+
+// NEW: add SLC filter if requested. For multiple, OR them together.
+  if (slcList.length) {
+         const anyClauses = slcList.map(v =>
+          `SpecialListingConditions/any(s: s eq '${esc(v)}')`
+         );
+        filterParts.push(`(${anyClauses.join(' or ')})`);
+       }
+       const filter = filterParts.join(' and ');
 
     const baseParams = new URLSearchParams();
     baseParams.set('$select', select);
@@ -522,6 +543,7 @@ app.get('/admin/ingest/city', async (req, res) => {
         // NEW: store null if address display is disallowed
         UnparsedAddress: (v.InternetAddressDisplayYN === false) ? null : (v.UnparsedAddress ?? null),
         InternetAddressDisplayYN: v.InternetAddressDisplayYN ?? null,
+        SpecialListingConditions: Array.isArray(v.SpecialListingConditions) ? v.SpecialListingConditions : [],
         PrimaryPhotoUrl: null // fill later via media job
       }));
       all.push(...pageItems);
