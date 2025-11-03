@@ -350,66 +350,66 @@ async function upsertThinListing(item) {
 }
 
 async function upsertCommercialListing(item) {
-    // item is the normalized object we build below
-    const {
-      ListingId,
-      City,
-      CityNorm,
-      State,
-      PostalCode,
-      Address,
-      Title,
-      ListingType,
-      PriceRaw,
-      ShortSummary,
-      PrimaryPhotoUrl,
-      IsActive = true,
-      ModificationTimestamp,
-      ModEpoch,
-      LastSeenAt
-    } = item;
-  
-    const params = {
-      TableName: DDB_TABLE_COMMERCIAL_LISTINGS,
-      Key: { ListingId },
-      UpdateExpression: `
-        SET City = :City,
-            CityNorm = :CityNorm,
-            State = :State,
-            PostalCode = :PostalCode,
-            Address = :Address,
-            Title = :Title,
-            ListingType = :ListingType,
-            PriceRaw = :PriceRaw,
-            ShortSummary = :ShortSummary,
-            PrimaryPhotoUrl = :PrimaryPhotoUrl,
-            IsActive = :IsActive,
-            ModificationTimestamp = :ModificationTimestamp,
-            ModEpoch = :ModEpoch,
-            LastSeenAt = :LastSeenAt
-      `.replace(/\s+/g, ' ').trim(),
-      ExpressionAttributeValues: {
-        ':City': City || null,
-        ':CityNorm': CityNorm || null,
-        ':State': State || null,
-        ':PostalCode': PostalCode || null,
-        ':Address': Address || null,
-        ':Title': Title || null,
-        ':ListingType': ListingType || null,
-        ':PriceRaw': PriceRaw || null,
-        ':ShortSummary': ShortSummary || null,
-        ':PrimaryPhotoUrl': PrimaryPhotoUrl || null,
-        ':IsActive': !!IsActive,
-        ':ModificationTimestamp': ModificationTimestamp || null,
-        ':ModEpoch': ModEpoch || Math.floor(Date.now() / 1000),
-        ':LastSeenAt': LastSeenAt || Math.floor(Date.now() / 1000)
-      }
-      // we could add a ConditionExpression like "attribute_not_exists(ModEpoch) OR ModEpoch <= :ModEpoch"
-      // but RapidAPI doesn't give us a real mod-time, so let's always overwrite for now
-    };
-  
-    await ddb.send(new UpdateCommand(params));
-  }
+  const {
+    ListingId,
+    City,
+    CityNorm,
+    State,          // we will alias this
+    PostalCode,
+    Address,
+    Title,
+    ListingType,
+    PriceRaw,
+    ShortSummary,
+    PrimaryPhotoUrl,
+    IsActive = true,
+    ModificationTimestamp,
+    ModEpoch,
+    LastSeenAt
+  } = item;
+
+  const params = {
+    TableName: DDB_TABLE_COMMERCIAL_LISTINGS,
+    Key: { ListingId },
+    UpdateExpression: `
+      SET City = :City,
+          CityNorm = :CityNorm,
+          #S = :State,
+          PostalCode = :PostalCode,
+          Address = :Address,
+          Title = :Title,
+          ListingType = :ListingType,
+          PriceRaw = :PriceRaw,
+          ShortSummary = :ShortSummary,
+          PrimaryPhotoUrl = :PrimaryPhotoUrl,
+          IsActive = :IsActive,
+          ModificationTimestamp = :ModificationTimestamp,
+          ModEpoch = :ModEpoch,
+          LastSeenAt = :LastSeenAt
+    `.replace(/\s+/g, ' ').trim(),
+    ExpressionAttributeNames: {
+      '#S': 'State'
+    },
+    ExpressionAttributeValues: {
+      ':City': City || null,
+      ':CityNorm': CityNorm || null,
+      ':State': State || null,
+      ':PostalCode': PostalCode || null,
+      ':Address': Address || null,
+      ':Title': Title || null,
+      ':ListingType': ListingType || null,
+      ':PriceRaw': PriceRaw || null,
+      ':ShortSummary': ShortSummary || null,
+      ':PrimaryPhotoUrl': PrimaryPhotoUrl || null,
+      ':IsActive': !!IsActive,
+      ':ModificationTimestamp': ModificationTimestamp || null,
+      ':ModEpoch': ModEpoch || Math.floor(Date.now() / 1000),
+      ':LastSeenAt': LastSeenAt || Math.floor(Date.now() / 1000)
+    }
+  };
+
+  await ddb.send(new UpdateCommand(params));
+}
 
 
 //tiny helper to shape one RapidAPI bulkDetails record into that structure
@@ -534,7 +534,7 @@ app.get('/admin/commercial/ingest/city', async (req, res) => {
     const cityRaw = String(req.query.city || '').trim();
     const stateRaw = String(req.query.state || 'CA').trim();
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
-    const BATCH_SIZE = 30;
+    const BATCH_SIZE = 20; // RapidAPI says max 20
     const debug = req.query.debug === '1';
 
     if (!cityRaw) {
@@ -544,7 +544,6 @@ app.get('/admin/commercial/ingest/city', async (req, res) => {
       return res.status(500).json({ error: 'RAPIDAPI_KEY not set in env' });
     }
 
-    // 1) get IDs for this city
     const searchBody = {
       country: 'US',
       state: stateRaw,
@@ -567,12 +566,10 @@ app.get('/admin/commercial/ingest/city', async (req, res) => {
     let errors = 0;
     const errorDetails = [];
 
-    // 2) hydrate in batches
     for (let i = 0; i < allIds.length; i += BATCH_SIZE) {
       const slice = allIds.slice(i, i + BATCH_SIZE);
 
       try {
-        // call bulkDetails with the same key
         const bulkResp = await rapidApiFetch('/loopnet/property/bulkDetails', {
           listingIds: slice
         });
