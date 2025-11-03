@@ -1,3 +1,4 @@
+
 // ===== PHASE 2 (fixed) =====
 
 // server.js
@@ -527,79 +528,89 @@ app.get('/webapi/metadata', async (req, res) => {
 
 //
 // Admin: ingest commercial listings for a city from RapidAPI (LoopNet)
+// Admin: ingest commercial listings for a city from RapidAPI (LoopNet)
 app.get('/admin/commercial/ingest/city', async (req, res) => {
-    try {
-      const cityRaw = String(req.query.city || '').trim();
-      const stateRaw = String(req.query.state || 'CA').trim();
-      const page = Math.max(parseInt(req.query.page || '1', 10), 1);
-      const BATCH_SIZE = 30;
-  
-      if (!cityRaw) {
-        return res.status(400).json({ error: 'city is required' });
-      }
-      if (!RAPIDAPI_KEY) {
-        return res.status(500).json({ error: 'RAPIDAPI_KEY not set in env' });
-      }
-  
-      // 1) We can skip autocomplete if you're always passing city+state,
-      // but let's keep it simple and go straight to searchByAddress:
-      const searchBody = {
-        country: 'US',
-        state: stateRaw,
-        city: cityRaw,
-        county: null,
-        zipCode: null,
-        page
-      };
-  
-      const searchResp = await rapidApiFetch('/loopnet/v2/sale/searchByAddress', searchBody);
-      const first = Array.isArray(searchResp.data) ? searchResp.data[0] : null;
-      if (!first) {
-        return res.json({ city: cityRaw, state: stateRaw, fetched: 0, written: 0, skipped: 0 });
-      }
-  
-      const allIds = Array.isArray(first.allListingIds) ? first.allListingIds.map(String) : [];
-  
-      let written = 0;
-      let skipped = 0;
-      let errors = 0;
-  
-      // 2) bulkDetails in batches of 30
-      for (let i = 0; i < allIds.length; i += BATCH_SIZE) {
-        const slice = allIds.slice(i, i + BATCH_SIZE);
-  
-        try {
-          const bulkResp = await rapidApiFetch('/loopnet/property/bulkDetails', {
-            listingIds: slice
-          });
-  
-          const items = Array.isArray(bulkResp.data) ? bulkResp.data : [];
-          for (const it of items) {
-            const norm = normalizeCommercialFromBulk(it, { city: cityRaw, state: stateRaw });
-            await upsertCommercialListing(norm);
-            written += 1;
-          }
-        } catch (e) {
-          console.error('bulkDetails batch failed', e?.message || e);
-          errors += 1;
-        }
-        // a tiny delay so we don’t hammer RapidAPI
-        await sleep(80);
-      }
-  
-      res.set('Cache-Control', 'no-store').json({
-        city: cityRaw,
-        state: stateRaw,
-        totalIds: allIds.length,
-        written,
-        skipped,
-        errors
-      });
-    } catch (err) {
-      console.error(err);
-      res.status(502).json({ error: 'commercial ingest failed', message: err?.message || String(err) });
+  try {
+    const cityRaw = String(req.query.city || '').trim();
+    const stateRaw = String(req.query.state || 'CA').trim();
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const BATCH_SIZE = 30;
+    const debug = req.query.debug === '1';
+
+    if (!cityRaw) {
+      return res.status(400).json({ error: 'city is required' });
     }
-  });
+    if (!RAPIDAPI_KEY) {
+      return res.status(500).json({ error: 'RAPIDAPI_KEY not set in env' });
+    }
+
+    // 1) get IDs for this city
+    const searchBody = {
+      country: 'US',
+      state: stateRaw,
+      city: cityRaw,
+      county: null,
+      zipCode: null,
+      page
+    };
+
+    const searchResp = await rapidApiFetch('/loopnet/v2/sale/searchByAddress', searchBody);
+    const first = Array.isArray(searchResp.data) ? searchResp.data[0] : null;
+    if (!first) {
+      return res.json({ city: cityRaw, state: stateRaw, totalIds: 0, written: 0, skipped: 0, errors: 0 });
+    }
+
+    const allIds = Array.isArray(first.allListingIds) ? first.allListingIds.map(String) : [];
+
+    let written = 0;
+    let skipped = 0;
+    let errors = 0;
+    const errorDetails = [];
+
+    // 2) hydrate in batches
+    for (let i = 0; i < allIds.length; i += BATCH_SIZE) {
+      const slice = allIds.slice(i, i + BATCH_SIZE);
+
+      try {
+        // call bulkDetails with the same key
+        const bulkResp = await rapidApiFetch('/loopnet/property/bulkDetails', {
+          listingIds: slice
+        });
+
+        const items = Array.isArray(bulkResp.data) ? bulkResp.data : [];
+        for (const it of items) {
+          const norm = normalizeCommercialFromBulk(it, { city: cityRaw, state: stateRaw });
+          await upsertCommercialListing(norm);
+          written += 1;
+        }
+      } catch (e) {
+        errors += 1;
+        const msg = e?.message || String(e);
+        console.error('bulkDetails batch failed', { batchStart: i, message: msg });
+        if (debug) {
+          errorDetails.push({ batchStart: i, message: msg });
+        }
+      }
+
+      await sleep(80);
+    }
+
+    const out = {
+      city: cityRaw,
+      state: stateRaw,
+      totalIds: allIds.length,
+      written,
+      skipped,
+      errors
+    };
+    if (debug) out.errorDetails = errorDetails;
+
+    res.set('Cache-Control', 'no-store').json(out);
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: 'commercial ingest failed', message: err?.message || String(err) });
+  }
+});
 
 // Property by city (case-insensitive; default last 90d; Active; includes PrimaryPhotoUrl via $expand)
 app.get('/webapi/property/by-city', async (req, res) => {
