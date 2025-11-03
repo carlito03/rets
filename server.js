@@ -1212,6 +1212,69 @@ app.get('/admin/seed/primary', async (req, res) => {
   }
 });
 
+//commercial 
+
+// GET /api/commercial/search/city?city=Covina&limit=50
+app.get('/api/commercial/search/city', async (req, res) => {
+    try {
+      const city = String(req.query.city || '').trim().toLowerCase();
+      if (!city) return res.status(400).json({ error: 'city is required' });
+  
+      const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10), 1), 100);
+  
+      // pagination cursor (opaque)
+      const cursor = req.query.cursor
+        ? JSON.parse(Buffer.from(String(req.query.cursor), 'base64').toString('utf8'))
+        : undefined;
+  
+      const params = {
+        TableName: DDB_TABLE_COMMERCIAL_LISTINGS,
+        IndexName: 'CityNorm-ModificationTimestamp-index',
+        KeyConditionExpression: 'CityNorm = :c',
+        ExpressionAttributeValues: { ':c': city },
+        ScanIndexForward: false,  // newest first
+        Limit: limit,
+        ExclusiveStartKey: cursor
+      };
+  
+      const resp = await ddb.send(new QueryCommand(params));
+  
+      // map to thin UI shape
+      const listings = (resp.Items || [])
+        // hide inactive
+        .filter(it => it.IsActive !== false)
+        .map(v => ({
+          listingId: v.ListingId,
+          title: v.Title || v.Address || null,
+          city: v.City || null,
+          state: v.State || null,
+          postalCode: v.PostalCode || null,
+          address: v.Address || null,
+          listingType: v.ListingType || null,
+          price: v.PriceRaw || null,
+          shortSummary: v.ShortSummary || null,
+          primaryPhotoUrl: v.CdnPrimary400 || v.PrimaryPhotoUrl || null,
+          modificationTimestamp: v.ModificationTimestamp || null
+        }));
+  
+      const next =
+        resp.LastEvaluatedKey
+          ? Buffer.from(JSON.stringify(resp.LastEvaluatedKey)).toString('base64')
+          : null;
+  
+      res.set('Cache-Control', 'private, max-age=15');
+      res.json({
+        city,
+        returned: listings.length,
+        cursor: next,
+        listings
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: 'commercial search failed', message: err?.message || String(err) });
+    }
+  });
+
 /* --------------------------------- Server -------------------------------- */
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
