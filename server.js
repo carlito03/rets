@@ -262,11 +262,12 @@ async function upsertThinListing(item) {
   const {
     ListingKey,
     City,
+    CountyOrParish,                 // NEW
     PostalCode,
     StateOrProvince,
     StandardStatus,
     PropertyType,
-PropertySubType,
+    PropertySubType,
     ListPrice,
     BedroomsTotal,
     BathroomsTotalInteger,
@@ -291,6 +292,7 @@ PropertySubType,
   const UpdateExpression = `
     SET City = :City,
         CityNorm = :CityNorm,
+        CountyOrParish = :CountyOrParish,
         PostalCode = :PostalCode,
         StateOrProvince = :StateOrProvince,
         PropertyType = :PropertyType,
@@ -315,14 +317,15 @@ PropertySubType,
 
   const params = {
     TableName: DDB_TABLE_LISTINGS,
-    Key: { ListingKey }, // match your table PK
+    Key: { ListingKey },
     UpdateExpression,
     ConditionExpression: 'attribute_not_exists(ModEpoch) OR ModEpoch <= :ModEpoch',
     ExpressionAttributeValues: {
       ':City': City || null,
       ':CityNorm': CityNorm,
+      ':CountyOrParish': CountyOrParish ?? null,          // NEW
       ':PropertyType': PropertyType ?? null,
-':PropertySubType': PropertySubType ?? null,
+      ':PropertySubType': PropertySubType ?? null,
       ':PostalCode': PostalCode ?? null,
       ':StateOrProvince': StateOrProvince ?? null,
       ':StandardStatus': StandardStatus ?? null,
@@ -338,11 +341,9 @@ PropertySubType,
       ':PriceSortDesc': PriceSortDesc,
       ':LastSeenAt': LastSeenAt,
       ':IsActive': IsActive,
-      // NEW values
       ':UnparsedAddress': UnparsedAddress ?? null,
       ':InternetAddressDisplayYN': (typeof InternetAddressDisplayYN === 'boolean') ? InternetAddressDisplayYN : null,
-      // store as an array (DocumentClient maps JS array -> DDB List)
-    ':SpecialListingConditions': Array.isArray(SpecialListingConditions) ? SpecialListingConditions : []
+      ':SpecialListingConditions': Array.isArray(SpecialListingConditions) ? SpecialListingConditions : []
     }
   };
 
@@ -691,58 +692,79 @@ app.get('/webapi/property/by-city', async (req, res) => {
 });
 
 // Admin: ingest thin listings for a city into DynamoDB (idempotent upsert per item)
+// Admin: ingest thin listings for a city OR county into DynamoDB (idempotent upsert per item)
 app.get('/admin/ingest/city', async (req, res) => {
   try {
     const cityRaw = String(req.query.city || '').trim();
-    if (!cityRaw) return res.status(400).json({ error: 'city is required' });
+    const countyRaw = String(req.query.county || '').trim();   // NEW
+    if (!cityRaw && !countyRaw) {
+      return res.status(400).json({ error: 'city or county is required' });
+    }
 
     const days = Math.min(Math.max(parseInt(req.query.days || '90', 10), 1), 365);
     const status = String(req.query.status || 'Active').trim();
+    const propertyType = String(req.query.propertyType || '').trim(); // NEW
 
-// NEW: Optional special-listing-conditions filter. Supports comma-separated.
-const slcRaw = String(req.query.slc || '').trim();
-const slcList = slcRaw ? slcRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+    // NEW: Optional special-listing-conditions filter. Supports comma-separated.
+    const slcRaw = String(req.query.slc || '').trim();
+    const slcList = slcRaw ? slcRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
 
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-
     const esc = s => s.replace(/'/g, "''");
 
     const select = [
       'ListingKey',
       'StandardStatus',
       'City',
+      'CountyOrParish',           // NEW – we want to store county too
       'PostalCode',
       'StateOrProvince',
       'ListPrice',
       'PropertyType',
-'PropertySubType',
+      'PropertySubType',
       'BedroomsTotal',
       'BathroomsTotalInteger',
       'LivingArea',
       'ModificationTimestamp',
       'PhotosChangeTimestamp',
-      // NEW address fields
       'UnparsedAddress',
       'InternetAddressDisplayYN',
       'SpecialListingConditions'
     ].join(',');
 
     const filterParts = [
-      `tolower(City) eq '${esc(cityRaw.toLowerCase())}'`,
       `StandardStatus eq '${esc(status)}'`,
       `InternetEntireListingDisplayYN eq true`,
       `ModificationTimestamp ge ${since}`
-    
-];
+    ];
 
-// NEW: add SLC filter if requested. For multiple, OR them together.
-  if (slcList.length) {
-         const anyClauses = slcList.map(v =>
-          `SpecialListingConditions/any(s: s eq '${esc(v)}')`
-         );
-        filterParts.push(`(${anyClauses.join(' or ')})`);
-       }
-       const filter = filterParts.join(' and ');
+    // if city provided, add city filter
+    if (cityRaw) {
+      filterParts.push(`tolower(City) eq '${esc(cityRaw.toLowerCase())}'`);
+    }
+
+    // if county provided, add county filter
+    if (countyRaw) {
+      filterParts.push(`CountyOrParish eq '${esc(countyRaw)}'`);
+    }
+
+    // optional: lock to CRMLS only
+    // filterParts.push(`OriginatingSystemName eq 'CRMLS'`);
+
+    // if propertyType provided, add it
+    if (propertyType) {
+      filterParts.push(`PropertyType eq '${esc(propertyType)}'`);
+    }
+
+    // add SLC filter if requested. For multiple, OR them together.
+    if (slcList.length) {
+      const anyClauses = slcList.map(v =>
+        `SpecialListingConditions/any(s: s eq '${esc(v)}')`
+      );
+      filterParts.push(`(${anyClauses.join(' or ')})`);
+    }
+
+    const filter = filterParts.join(' and ');
 
     const baseParams = new URLSearchParams();
     baseParams.set('$select', select);
@@ -760,10 +782,11 @@ const slcList = slcRaw ? slcRaw.split(',').map(s => s.trim()).filter(Boolean) : 
         ListingKey: v.ListingKey,
         City: v.City,
         CityNorm: toNorm(v.City),
+        CountyOrParish: v.CountyOrParish ?? null,  // NEW
         PostalCode: v.PostalCode,
         StateOrProvince: v.StateOrProvince,
         PropertyType: v.PropertyType,
-PropertySubType: v.PropertySubType,
+        PropertySubType: v.PropertySubType,
         StandardStatus: v.StandardStatus,
         ListPrice: v.ListPrice,
         BedroomsTotal: v.BedroomsTotal,
@@ -792,7 +815,13 @@ PropertySubType: v.PropertySubType,
     }
 
     res.set('Cache-Control', 'no-store').json({
-      city: cityRaw, status, since, fetched: all.length, written, skipped
+      city: cityRaw || null,
+      county: countyRaw || null,
+      status,
+      since,
+      fetched: all.length,
+      written,
+      skipped
     });
   } catch (err) {
     console.error(err);
