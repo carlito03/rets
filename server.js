@@ -1324,6 +1324,94 @@ app.get('/api/commercial/search/city', async (req, res) => {
     }
   });
 
+  // Quick peek into DynamoDB to see what ingest wrote
+app.get('/admin/ddb/peek', async (req, res) => {
+  try {
+    const cityRaw = String(req.query.city || '').trim().toLowerCase();
+    const countyRaw = String(req.query.county || '').trim();
+    const slcRaw = String(req.query.slc || '').trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10), 1), 200);
+
+    // we’ll build a Query if we can, else fall back to Scan (not ideal)
+    // best case: user gave city → we can use CityNorm-ModificationTimestamp-index
+    if (cityRaw) {
+      const params = {
+        TableName: DDB_TABLE_LISTINGS,
+        IndexName: 'CityNorm-ModificationTimestamp-index',
+        KeyConditionExpression: 'CityNorm = :c',
+        ExpressionAttributeValues: {
+          ':c': cityRaw
+        },
+        ScanIndexForward: false,
+        Limit: limit
+      };
+
+      const resp = await ddb.send(new QueryCommand(params));
+      return res.json({
+        mode: 'city',
+        count: resp.Count || 0,
+        items: resp.Items || []
+      });
+    }
+
+    // if county given, we don’t have a county index, so do a small scan
+    if (countyRaw) {
+      const params = {
+        TableName: DDB_TABLE_LISTINGS,
+        FilterExpression: 'CountyOrParish = :co',
+        ExpressionAttributeValues: {
+          ':co': countyRaw
+        },
+        Limit: limit
+      };
+      const resp = await ddb.send(new QueryCommand(params)).catch(() => null);
+
+      // QueryCommand can’t filter on non-key attributes without index, so do a Scan instead
+      if (!resp) {
+        const { ScanCommand } = require('@aws-sdk/lib-dynamodb');
+        const scanResp = await ddb.send(new ScanCommand({
+          TableName: DDB_TABLE_LISTINGS,
+          FilterExpression: 'CountyOrParish = :co',
+          ExpressionAttributeValues: { ':co': countyRaw },
+          Limit: limit
+        }));
+        return res.json({
+          mode: 'county-scan',
+          count: scanResp.Count || 0,
+          items: scanResp.Items || []
+        });
+      }
+
+      return res.json({
+        mode: 'county',
+        count: resp.Count || 0,
+        items: resp.Items || []
+      });
+    }
+
+    // SLC-only peek (e.g. just “show me probate ones you’ve got”)
+    if (slcRaw) {
+      const { ScanCommand } = require('@aws-sdk/lib-dynamodb');
+      const scanResp = await ddb.send(new ScanCommand({
+        TableName: DDB_TABLE_LISTINGS,
+        FilterExpression: 'contains(SpecialListingConditions, :slc)',
+        ExpressionAttributeValues: { ':slc': slcRaw },
+        Limit: limit
+      }));
+      return res.json({
+        mode: 'slc-scan',
+        count: scanResp.Count || 0,
+        items: scanResp.Items || []
+      });
+    }
+
+    return res.status(400).json({ error: 'Provide city= or county= or slc=' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'peek failed', message: err.message });
+  }
+});
+
 /* --------------------------------- Server -------------------------------- */
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
