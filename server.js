@@ -1492,54 +1492,36 @@ app.get('/admin/tst/listingterms-values', async (req, res) => {
 });
 
 // probe remarks for keywords (public+private-ish) to see if MLS is surfacing them
+// probe remarks for keywords (public + private) — client-side filter
 app.get('/admin/tst/remarks', async (req, res) => {
   try {
-    // what are we searching for?
-    const needleRaw = String(req.query.contains || '').trim();
-    if (!needleRaw) {
-      return res.status(400).json({ error: 'provide ?contains=probate (or short sale etc.)' });
+    const containsRaw = String(req.query.contains || '').trim();
+    if (!containsRaw) {
+      return res.status(400).json({ error: 'contains= is required' });
     }
 
-    // keep it modest
+    const needle = containsRaw.toLowerCase();
     const days = Math.min(Math.max(parseInt(req.query.days || '30', 10), 1), 365);
     const top = Math.min(Math.max(parseInt(req.query.top || '200', 10), 1), 1000);
-    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
-    // lower-case search
-    const needle = needleRaw.toLowerCase();
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     const esc = s => s.replace(/'/g, "''");
 
-    // IMPORTANT:
-    // I’m assuming these 3 fields might exist in your feed:
-    // - PublicRemarks
-    // - PrivateRemarks   (sometimes called PrivateRemarks, AgentRemarks, or ConfidentialInformation)
-    // - ConfidentialInformation
-    //
-    // We’ll $select all 3, and we’ll do the "contains" on the ones that actually filter.
-    // If your feed 500s on an unknown field, comment that field out.
-
+    // only fields we know exist
     const select = [
       'ListingKey',
-      'StandardStatus',
       'City',
       'CountyOrParish',
-      'ModificationTimestamp',
+      'StandardStatus',
       'PublicRemarks',
       'PrivateRemarks',
-      'ConfidentialInformation'
+      'ModificationTimestamp'
     ].join(',');
 
-    // build a predicate that tries all 3
-    const containsClauses = [
-      `contains(tolower(PublicRemarks), '${esc(needle)}')`,
-      `contains(tolower(PrivateRemarks), '${esc(needle)}')`,
-      `contains(tolower(ConfidentialInformation), '${esc(needle)}')`
-    ];
-
+    // broad-ish filter: recent + visible
     const filter = [
       `ModificationTimestamp ge ${since}`,
-      `InternetEntireListingDisplayYN eq true`,
-      `(${containsClauses.join(' or ')})`
+      `InternetEntireListingDisplayYN eq true`
     ].join(' and ');
 
     const params = new URLSearchParams();
@@ -1547,33 +1529,42 @@ app.get('/admin/tst/remarks', async (req, res) => {
     params.set('$filter', filter);
     params.set('$orderby', 'ModificationTimestamp desc');
     params.set('$top', String(top));
-    if (PRETTY_ENUMS === 'true') params.set('PrettyEnums', 'true');
+    // if you like pretty enums everywhere:
+    if (process.env.PRETTY_ENUMS === 'true') params.set('PrettyEnums', 'true');
 
     const data = await trestleFetch(`/Property?${params.toString()}`);
-    const rows = Array.isArray(data.value) ? data.value : [];
 
-    // return just the bits that help you debug
-    const items = rows.map(v => ({
-      ListingKey: v.ListingKey,
-      City: v.City,
-      CountyOrParish: v.CountyOrParish,
-      StandardStatus: v.StandardStatus,
-      // show which field actually had the word
-      hits: {
-        public: v.PublicRemarks && v.PublicRemarks.toLowerCase().includes(needle) ? true : false,
-        private: v.PrivateRemarks && v.PrivateRemarks.toLowerCase().includes(needle) ? true : false,
-        confidential: v.ConfidentialInformation && v.ConfidentialInformation.toLowerCase().includes(needle) ? true : false
-      },
-      PublicRemarks: v.PublicRemarks || null,
-      PrivateRemarks: v.PrivateRemarks || null,
-      ConfidentialInformation: v.ConfidentialInformation || null
-    }));
+    const hits = [];
+    for (const v of (data.value || [])) {
+      const pub = String(v.PublicRemarks || '').toLowerCase();
+      const priv = String(v.PrivateRemarks || '').toLowerCase();
 
-    res.json({
-      contains: needleRaw,
+      const hitPublic = pub.includes(needle);
+      const hitPrivate = priv.includes(needle);
+
+      if (hitPublic || hitPrivate) {
+        hits.push({
+          ListingKey: v.ListingKey,
+          City: v.City,
+          CountyOrParish: v.CountyOrParish ?? null,
+          StandardStatus: v.StandardStatus,
+          hits: {
+            public: hitPublic,
+            private: hitPrivate
+          },
+          PublicRemarks: v.PublicRemarks || null,
+          PrivateRemarks: v.PrivateRemarks || null,
+          ModificationTimestamp: v.ModificationTimestamp
+        });
+      }
+    }
+
+    res.set('Cache-Control', 'no-store').json({
+      contains: containsRaw,
       days,
-      returned: items.length,
-      items
+      scanned: (data.value || []).length,
+      matched: hits.length,
+      items: hits
     });
   } catch (err) {
     console.error(err);
