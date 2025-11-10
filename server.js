@@ -1572,6 +1572,58 @@ app.get('/admin/tst/remarks', async (req, res) => {
   }
 });
 
+// find listings in Dynamo by city + partial address
+app.get('/admin/ddb/find-by-address', async (req, res) => {
+  try {
+    const cityRaw = String(req.query.city || '').trim().toLowerCase();
+    const containsRaw = String(req.query.contains || '').trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10), 1), 200);
+
+    if (!cityRaw) {
+      return res.status(400).json({ error: 'city is required' });
+    }
+    if (!containsRaw) {
+      return res.status(400).json({ error: 'contains is required (street part)' });
+    }
+
+    // 1) query by city using the GSI you already use: CityNorm-ModificationTimestamp-index
+    const params = {
+      TableName: DDB_TABLE_LISTINGS,
+      IndexName: 'CityNorm-ModificationTimestamp-index',
+      KeyConditionExpression: 'CityNorm = :c',
+      ExpressionAttributeValues: {
+        ':c': cityRaw
+      },
+      ScanIndexForward: false,
+      Limit: 500 // pull a chunk, we’ll post-filter
+    };
+
+    const { QueryCommand } = require('@aws-sdk/lib-dynamodb');
+    const resp = await ddb.send(new QueryCommand(params));
+    const items = resp.Items || [];
+
+    // 2) post-filter in JS by address substring, case-insensitive
+    const needle = containsRaw.toLowerCase();
+    const matched = items
+      .filter(it => {
+        if (it.InternetAddressDisplayYN === false) return false; // respect MLS rules
+        const addr = (it.UnparsedAddress || '').toLowerCase();
+        return addr.includes(needle);
+      })
+      .slice(0, limit);
+
+    return res.json({
+      city: cityRaw,
+      contains: containsRaw,
+      returned: matched.length,
+      items: matched
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'find-by-address failed', message: err.message });
+  }
+});
+
 /* --------------------------------- Server -------------------------------- */
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
