@@ -1440,6 +1440,57 @@ app.get('/admin/tst/slc-values', async (req, res) => {
   }
 });
 
+// quick sample of distinct ListingTerms values from recent properties
+app.get('/admin/tst/listingterms-values', async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.top || '200', 10), 1), 1000);
+    const days = Math.min(Math.max(parseInt(req.query.days || '30', 10), 1), 365);
+
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const esc = s => s.replace(/'/g, "''");
+
+    const params = new URLSearchParams();
+    params.set('$select', 'ListingKey,ListingTerms,ModificationTimestamp');
+    params.set('$filter', `ModificationTimestamp ge ${since} and InternetEntireListingDisplayYN eq true`);
+    params.set('$orderby', 'ModificationTimestamp desc');
+    params.set('$top', String(limit));
+    if (PRETTY_ENUMS === 'true') params.set('PrettyEnums', 'true');
+
+    const data = await trestleFetch(`/Property?${params.toString()}`);
+    const rows = Array.isArray(data.value) ? data.value : [];
+
+    // ListingTerms sometimes comes back as:
+    // - a single string: "Cash"
+    // - a comma string: "Cash,Conventional"
+    // - an array (less common, depends on feed)
+    const set = new Set();
+
+    for (const r of rows) {
+      const lt = r.ListingTerms;
+      if (!lt) continue;
+
+      if (Array.isArray(lt)) {
+        lt.forEach(v => v && set.add(String(v).trim()));
+      } else {
+        // assume string, split on comma
+        String(lt)
+          .split(',')
+          .map(s => s.trim())
+          .filter(Boolean)
+          .forEach(v => set.add(v));
+      }
+    }
+
+    res.json({
+      count: set.size,
+      values: Array.from(set).sort()
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: 'listingterms probe failed', message: err.message });
+  }
+});
+
 /* --------------------------------- Server -------------------------------- */
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
