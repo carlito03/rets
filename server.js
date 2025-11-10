@@ -71,7 +71,10 @@ const {
   API_KEYS = '',
 
   // Optional: tweak selection / enum prettifying
-  PRETTY_ENUMS = 'true'
+  PRETTY_ENUMS = 'true',
+
+MAX_WRITE_PER_INGEST = '500'
+
 } = process.env;
 
 /* -------------------------- Commercial  -------------------------- */
@@ -1409,6 +1412,31 @@ app.get('/admin/ddb/peek', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'peek failed', message: err.message });
+  }
+});
+
+// quick: see what SpecialListingConditions looks like from Trestle
+app.get('/admin/tst/slc-values', async (req, res) => {
+  try {
+    // small sample
+    const p = new URLSearchParams();
+    p.set('$top', '50');
+    p.set('$select', 'ListingKey,SpecialListingConditions');
+    if (PRETTY_ENUMS === 'true') p.set('PrettyEnums', 'true');
+
+    const data = await trestleFetch(`/Property?${p.toString()}`);
+
+    const all = (data.value || []).flatMap(v => {
+      if (Array.isArray(v.SpecialListingConditions)) return v.SpecialListingConditions;
+      if (v.SpecialListingConditions) return [v.SpecialListingConditions];
+      return [];
+    });
+
+    const unique = [...new Set(all)].sort((a, b) => a.localeCompare(b));
+    res.json({ count: unique.length, values: unique });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: 'Failed to fetch SLC sample', message: err.message });
   }
 });
 
