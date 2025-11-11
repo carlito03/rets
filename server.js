@@ -114,7 +114,9 @@ app.options('*', cors(corsOptions)); // preflight
 
 /* --------------------------- API key middleware -------------------------- */
 function requireApiKey(req, res, next) {
-  if (req.path === '/health') return next(); // healthcheck open
+  // open routes that don't need authentication
+  if (req.path === '/health') return next();
+  if (req.path === '/public/ddb/find-by-address') return next();  // <-- NEW: allow frontend public route
 
   const key = req.header('x-api-key');
   if (!API_KEY_SET.size) return res.status(401).json({ error: 'API key required' });
@@ -1621,6 +1623,41 @@ app.get('/admin/ddb/find-by-address', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'find-by-address failed', message: err.message });
+  }
+});
+
+// Public version of address lookup (no API key required)
+app.get('/public/ddb/find-by-address', async (req, res) => {
+  try {
+    const cityRaw = String(req.query.city || '').trim().toLowerCase();
+    const containsRaw = String(req.query.contains || '').trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '10', 10), 1), 50);
+
+    if (!cityRaw || !containsRaw) {
+      return res.status(400).json({ error: 'city and contains are required' });
+    }
+
+    // Simple scan (safe for dev, small limit)
+    const { ScanCommand } = require('@aws-sdk/lib-dynamodb');
+    const resp = await ddb.send(new ScanCommand({
+      TableName: DDB_TABLE_LISTINGS,
+      FilterExpression: 'CityNorm = :c AND contains(UnparsedAddress, :addr)',
+      ExpressionAttributeValues: {
+        ':c': cityRaw,
+        ':addr': containsRaw
+      },
+      Limit: limit
+    }));
+
+    res.set('Cache-Control', 'no-store').json({
+      city: cityRaw,
+      contains: containsRaw,
+      returned: resp.Count || 0,
+      items: resp.Items || []
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'public find failed', message: err.message });
   }
 });
 
