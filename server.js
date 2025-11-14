@@ -899,12 +899,17 @@ app.get('/admin/s3/ping', async (req, res) => {
   }
 });
 
+// Search thin listings by city (supports optional propertyType, e.g. "Residential Lease")
 app.get('/api/search/city', async (req, res) => {
   try {
     const city = String(req.query.city || '').trim().toLowerCase();
     if (!city) return res.status(400).json({ error: 'city is required' });
 
     const status = String(req.query.status || 'Active').trim();
+
+    // NEW: optional PropertyType filter ("Residential", "Residential Lease", etc.)
+    const propertyType = String(req.query.propertyType || '').trim();
+
     const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10), 1), 100);
 
     // pagination cursor (opaque)
@@ -912,12 +917,24 @@ app.get('/api/search/city', async (req, res) => {
       ? JSON.parse(Buffer.from(String(req.query.cursor), 'base64').toString('utf8'))
       : undefined;
 
+    // --- build filter + values ---
+    let filterExpr = 'StandardStatus = :s';
+    const exprValues = {
+      ':c': city,
+      ':s': status
+    };
+
+    if (propertyType) {
+      filterExpr += ' AND PropertyType = :pt';
+      exprValues[':pt'] = propertyType;
+    }
+
     const params = {
       TableName: DDB_TABLE_LISTINGS,
       IndexName: 'CityNorm-ModificationTimestamp-index',
       KeyConditionExpression: 'CityNorm = :c',
-      FilterExpression: 'StandardStatus = :s',
-      ExpressionAttributeValues: { ':c': city, ':s': status },
+      FilterExpression: filterExpr,
+      ExpressionAttributeValues: exprValues,
       ScanIndexForward: false,          // newest first (by ModificationTimestamp)
       Limit: limit,
       ExclusiveStartKey: cursor
@@ -934,7 +951,7 @@ app.get('/api/search/city', async (req, res) => {
       ListingKey: v.ListingKey,
       City: v.City,
       propertyType: v.PropertyType ?? null,
-propertySubType: v.PropertySubType ?? null,
+      propertySubType: v.PropertySubType ?? null,
       PostalCode: v.PostalCode,
       StateOrProvince: v.StateOrProvince,
       StandardStatus: v.StandardStatus,
@@ -944,16 +961,23 @@ propertySubType: v.PropertySubType ?? null,
       LivingArea: v.LivingArea,
       ModificationTimestamp: v.ModificationTimestamp,
       PhotosChangeTimestamp: v.PhotosChangeTimestamp,
-      // NEW: expose address only if allowed
+      // address only if allowed
       address: (v.InternetAddressDisplayYN === false) ? null : (v.UnparsedAddress ?? null),
       primaryPhotoUrl: v.CdnPrimary400 ?? v.PrimaryPhotoUrl ?? null
     }));
 
     res.set('Cache-Control', 'private, max-age=15');
-    res.json({ city, status, returned: listings.length, cursor: next, listings });
+    res.json({
+      city,
+      status,
+      propertyType: propertyType || null,   // NEW: echo back what was requested
+      returned: listings.length,
+      cursor: next,
+      listings
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'search failed' });
+    res.status(500).json({ error: 'search failed', message: err?.message || String(err) });
   }
 });
 
