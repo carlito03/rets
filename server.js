@@ -906,10 +906,7 @@ app.get('/api/search/city', async (req, res) => {
     if (!city) return res.status(400).json({ error: 'city is required' });
 
     const status = String(req.query.status || 'Active').trim();
-
-    // NEW: optional PropertyType filter ("Residential", "Residential Lease", etc.)
-    const propertyType = String(req.query.propertyType || '').trim();
-
+    const propertyType = String(req.query.propertyType || '').trim(); // NEW
     const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10), 1), 100);
 
     // pagination cursor (opaque)
@@ -917,60 +914,73 @@ app.get('/api/search/city', async (req, res) => {
       ? JSON.parse(Buffer.from(String(req.query.cursor), 'base64').toString('utf8'))
       : undefined;
 
-    // --- build filter + values ---
-    let filterExpr = 'StandardStatus = :s';
-    const exprValues = {
-      ':c': city,
-      ':s': status
-    };
-
-    if (propertyType) {
-      filterExpr += ' AND PropertyType = :pt';
-      exprValues[':pt'] = propertyType;
-    }
-
-    const params = {
+    // We’ll always filter Status in Dynamo,
+    // but handle PropertyType in Node so we can keep paging until we have enough matches.
+    const baseParams = {
       TableName: DDB_TABLE_LISTINGS,
       IndexName: 'CityNorm-ModificationTimestamp-index',
       KeyConditionExpression: 'CityNorm = :c',
-      FilterExpression: filterExpr,
-      ExpressionAttributeValues: exprValues,
-      ScanIndexForward: false,          // newest first (by ModificationTimestamp)
-      Limit: limit,
+      FilterExpression: 'StandardStatus = :s',
+      ExpressionAttributeValues: { ':c': city, ':s': status },
+      ScanIndexForward: false,          // newest first
+      Limit: limit,                     // per-page read size (we may loop)
       ExclusiveStartKey: cursor
     };
 
-    const resp = await ddb.send(new QueryCommand(params));
-    const next =
-      resp.LastEvaluatedKey
-        ? Buffer.from(JSON.stringify(resp.LastEvaluatedKey)).toString('base64')
-        : null;
+    const listings = [];
+    let lastKey = cursor;
+    let finished = false;
 
-    // map thin fields the UI needs
-    const listings = (resp.Items || []).map(v => ({
-      ListingKey: v.ListingKey,
-      City: v.City,
-      propertyType: v.PropertyType ?? null,
-      propertySubType: v.PropertySubType ?? null,
-      PostalCode: v.PostalCode,
-      StateOrProvince: v.StateOrProvince,
-      StandardStatus: v.StandardStatus,
-      ListPrice: v.ListPrice,
-      BedroomsTotal: v.BedroomsTotal,
-      BathroomsTotalInteger: v.BathroomsTotalInteger,
-      LivingArea: v.LivingArea,
-      ModificationTimestamp: v.ModificationTimestamp,
-      PhotosChangeTimestamp: v.PhotosChangeTimestamp,
-      // address only if allowed
-      address: (v.InternetAddressDisplayYN === false) ? null : (v.UnparsedAddress ?? null),
-      primaryPhotoUrl: v.CdnPrimary400 ?? v.PrimaryPhotoUrl ?? null
-    }));
+    while (!finished && listings.length < limit) {
+      const params = { ...baseParams, ExclusiveStartKey: lastKey };
+      const resp = await ddb.send(new QueryCommand(params));
+
+      const pageItems = resp.Items || [];
+
+      // apply optional PropertyType filter here
+      const filtered = propertyType
+        ? pageItems.filter(it => (it.PropertyType || '') === propertyType)
+        : pageItems;
+
+      // map thin fields the UI needs
+      for (const v of filtered) {
+        if (listings.length >= limit) break;
+        listings.push({
+          ListingKey: v.ListingKey,
+          City: v.City,
+          propertyType: v.PropertyType ?? null,
+          propertySubType: v.PropertySubType ?? null,
+          PostalCode: v.PostalCode,
+          StateOrProvince: v.StateOrProvince,
+          StandardStatus: v.StandardStatus,
+          ListPrice: v.ListPrice,
+          BedroomsTotal: v.BedroomsTotal,
+          BathroomsTotalInteger: v.BathroomsTotalInteger,
+          LivingArea: v.LivingArea,
+          ModificationTimestamp: v.ModificationTimestamp,
+          PhotosChangeTimestamp: v.PhotosChangeTimestamp,
+          // address only if allowed
+          address: (v.InternetAddressDisplayYN === false) ? null : (v.UnparsedAddress ?? null),
+          primaryPhotoUrl: v.CdnPrimary400 ?? v.PrimaryPhotoUrl ?? null
+        });
+      }
+
+      lastKey = resp.LastEvaluatedKey;
+      if (!lastKey || listings.length >= limit) {
+        finished = true;
+      }
+    }
+
+    const next =
+      lastKey
+        ? Buffer.from(JSON.stringify(lastKey)).toString('base64')
+        : null;
 
     res.set('Cache-Control', 'private, max-age=15');
     res.json({
       city,
       status,
-      propertyType: propertyType || null,   // NEW: echo back what was requested
+      propertyType: propertyType || null,
       returned: listings.length,
       cursor: next,
       listings
