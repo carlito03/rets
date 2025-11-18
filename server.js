@@ -1143,14 +1143,20 @@ app.get('/webapi/property/by-id', async (req, res) => {
       }
   
       // ---------------- cache MISS or forced refresh ----------------
-      const select = [
-        'ListingKey','ListingId','StandardStatus',
-        'UnparsedAddress','StreetNumber','StreetNumberNumeric','StreetDirPrefix','StreetName','StreetSuffix','UnitNumber',
-        'City','StateOrProvince','PostalCode',
-        'ListPrice','BedroomsTotal','BathroomsTotalInteger','LivingArea','LotSizeArea','YearBuilt',
-        'PropertySubType','PropertyType','PublicRemarks',
-        'ModificationTimestamp','PhotosChangeTimestamp'
-      ].join(',');
+const select = [
+  'ListingKey','ListingId','StandardStatus',
+  'UnparsedAddress','StreetNumber','StreetNumberNumeric','StreetDirPrefix','StreetName','StreetSuffix','UnitNumber',
+  'City','StateOrProvince','PostalCode',
+  'ListPrice','BedroomsTotal','BathroomsTotalInteger','LivingArea','LotSizeArea','YearBuilt',
+  'PropertySubType','PropertyType','PublicRemarks',
+  // --- Minimal agent/office fields ---
+  'ListAgentFullName',
+  'ListAgentStateLicense',
+  'ListOfficeName',
+  // --- Timestamps ---
+  'ModificationTimestamp','PhotosChangeTimestamp'
+].join(',');
+
   
       const esc = s => s.replace(/\'/g, "''");
       const params = new URLSearchParams();
@@ -1166,35 +1172,50 @@ app.get('/webapi/property/by-id', async (req, res) => {
       if (!v) return res.status(404).json({ error: 'not found' });
   
       const detail = {
-        ListingKey: v.ListingKey,
-        ListingId: v.ListingId ?? null,
-        StandardStatus: v.StandardStatus ?? null,
-        Address: {
-          Unparsed: v.UnparsedAddress ?? null,
-          StreetNumber: v.StreetNumber ?? null,
-          StreetNumberNumeric: v.StreetNumberNumeric ?? null,
-          StreetDirPrefix: v.StreetDirPrefix ?? null,
-          StreetName: v.StreetName ?? null,
-          StreetSuffix: v.StreetSuffix ?? null,
-          UnitNumber: v.UnitNumber ?? null,
-          City: v.City ?? null,
-          StateOrProvince: v.StateOrProvince ?? null,
-          PostalCode: v.PostalCode ?? null
-        },
-        Facts: {
-          ListPrice: v.ListPrice ?? null,
-          BedroomsTotal: v.BedroomsTotal ?? null,
-          BathroomsTotalInteger: v.BathroomsTotalInteger ?? null,
-          LivingArea: v.LivingArea ?? null,
-          LotSizeArea: v.LotSizeArea ?? null,
-          YearBuilt: v.YearBuilt ?? null,
-          PropertyType: v.PropertyType ?? null,
-          PropertySubType: v.PropertySubType ?? null
-        },
-        PublicRemarks: v.PublicRemarks ?? null,
-        ModificationTimestamp: v.ModificationTimestamp ?? null,
-        PhotosChangeTimestamp: v.PhotosChangeTimestamp ?? null
-      };
+  ListingKey: v.ListingKey,
+  ListingId: v.ListingId ?? null,
+  StandardStatus: v.StandardStatus ?? null,
+
+  Address: {
+    Unparsed: v.UnparsedAddress ?? null,
+    StreetNumber: v.StreetNumber ?? null,
+    StreetNumberNumeric: v.StreetNumberNumeric ?? null,
+    StreetDirPrefix: v.StreetDirPrefix ?? null,
+    StreetName: v.StreetName ?? null,
+    StreetSuffix: v.StreetSuffix ?? null,
+    UnitNumber: v.UnitNumber ?? null,
+    City: v.City ?? null,
+    StateOrProvince: v.StateOrProvince ?? null,
+    PostalCode: v.PostalCode ?? null
+  },
+
+  Facts: {
+    ListPrice: v.ListPrice ?? null,
+    BedroomsTotal: v.BedroomsTotal ?? null,
+    BathroomsTotalInteger: v.BathroomsTotalInteger ?? null,
+    LivingArea: v.LivingArea ?? null,
+    LotSizeArea: v.LotSizeArea ?? null,
+    YearBuilt: v.YearBuilt ?? null,
+    PropertyType: v.PropertyType ?? null,
+    PropertySubType: v.PropertySubType ?? null
+  },
+
+  // --- Minimal agent info ---
+  Agent: {
+    Name: v.ListAgentFullName ?? null,
+    License: v.ListAgentStateLicense ?? null
+  },
+
+  // --- Minimal office info ---
+  Office: {
+    Name: v.ListOfficeName ?? null
+  },
+
+  PublicRemarks: v.PublicRemarks ?? null,
+  ModificationTimestamp: v.ModificationTimestamp ?? null,
+  PhotosChangeTimestamp: v.PhotosChangeTimestamp ?? null
+};
+
   
       const mediaSrc = Array.isArray(v.Media) ? v.Media.map(m => m?.MediaURL).filter(Boolean) : [];
       const primarySrc = mediaSrc[0] || null;
@@ -1300,9 +1321,9 @@ app.get('/admin/seed/primary', async (req, res) => {
   }
 });
 
-//commercial 
-
+// commercial 
 // GET /api/commercial/search/city?city=Covina&limit=50
+
 app.get('/api/commercial/search/city', async (req, res) => {
     try {
       const city = String(req.query.city || '').trim().toLowerCase();
