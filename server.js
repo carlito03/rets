@@ -1716,6 +1716,87 @@ app.get('/public/ddb/find-by-address', async (req, res) => {
   }
 });
 
+// === Open House (Trestle OData) ==============================================
+// GET /webapi/openhouse/by-listing?listingKey=12345&days=30&top=50
+// Returns upcoming (or recent window) open houses for a listing.
+app.get('/webapi/openhouse/by-listing', async (req, res) => {
+  try {
+    const listingKey = String(req.query.listingKey || '').trim();
+    if (!listingKey) return res.status(400).json({ error: 'listingKey is required' });
+
+    const days = Math.min(Math.max(parseInt(req.query.days || '30', 10), 1), 365);
+    const top = Math.min(Math.max(parseInt(req.query.top || '50', 10), 1), 200);
+
+    // window: from "now - days" to future (covers upcoming + recent)
+    const nowIso = new Date().toISOString();
+    const sinceIso = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+    const esc = s => s.replace(/'/g, "''");
+
+    // pick a conservative set of fields across RESO implementations
+    const select = [
+      'OpenHouseKey',
+      'ListingKey',
+      'OpenHouseType',             // e.g. "Public"
+      'OpenHouseStartTime',        // DateTime
+      'OpenHouseEndTime',          // DateTime
+      'OpenHouseRemarks',          // Optional text
+      'ModificationTimestamp'
+    ].join(',');
+
+    // filter by ListingKey and date window (start >= since) and end in future if you want strictly upcoming
+    const filter = [
+      `ListingKey eq '${esc(listingKey)}'`,
+      `OpenHouseStartTime ge ${sinceIso}`
+      // If you want strictly future events, use:
+      // `OpenHouseEndTime ge ${nowIso}`
+    ].join(' and ');
+
+    const p = new URLSearchParams();
+    p.set('$select', select);
+    p.set('$filter', filter);
+    p.set('$orderby', 'OpenHouseStartTime asc');
+    p.set('$top', String(top));
+    if (PRETTY_ENUMS === 'true') p.set('PrettyEnums', 'true');
+
+    const data = await trestleFetch(`/OpenHouse?${p.toString()}`);
+    const rows = Array.isArray(data.value) ? data.value : [];
+
+    res.set('Cache-Control', 'private, max-age=15').json({
+      listingKey,
+      returned: rows.length,
+      items: rows
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: 'openhouse fetch failed', message: err?.message || String(err) });
+  }
+});
+
+// Optional: RETS search variant (some MLSes prefer this path)
+// GET /webapi/openhouse/rets?listingKey=12345&class=OpenHouse
+app.get('/webapi/openhouse/rets', async (req, res) => {
+  try {
+    const listingKey = String(req.query.listingKey || '').trim();
+    if (!listingKey) return res.status(400).json({ error: 'listingKey is required' });
+
+    // Pass through to Trestle RETS search endpoint via trestleFetch (absolute URL)
+    const url = `https://api-trestle.corelogic.com/trestle/rets/search` +
+                `?SearchType=OpenHouse&Class=OpenHouse&Query=(ListingKey=${encodeURIComponent(listingKey)})` +
+                `&Format=JSON`;
+    const data = await trestleFetch(url); // returns JSON when Format=JSON
+
+    res.set('Cache-Control', 'private, max-age=15').json({
+      listingKey,
+      items: data?.value || data || []
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: 'openhouse rets fetch failed', message: err?.message || String(err) });
+  }
+});
+
+
 /* --------------------------------- Server -------------------------------- */
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
