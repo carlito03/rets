@@ -1796,6 +1796,109 @@ app.get('/webapi/openhouse/rets', async (req, res) => {
   }
 });
 
+// Search thin listings by CITY with bedroom + subtype filters
+// GET /api/search/units?city=Los%20Angeles&bedsMin=5&bedsMax=10&subType=duplex,condominium,triplex,quadruplex&limit=100&cursor=...
+app.get('/api/search/units', async (req, res) => {
+  try {
+    const city = String(req.query.city || '').trim().toLowerCase();
+    if (!city) return res.status(400).json({ error: 'city is required' });
+
+    const status = String(req.query.status || 'Active').trim();
+
+    const bedsMin = Number.isFinite(+req.query.bedsMin) ? +req.query.bedsMin : 0;
+    const bedsMax = Number.isFinite(+req.query.bedsMax) ? +req.query.bedsMax : 999;
+
+    // comma-separated subtypes, case-insensitive substring match
+    const subTypeRaw = String(req.query.subType || '').trim();
+    const subFilters = subTypeRaw
+      ? subTypeRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+      : [];
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10), 1), 100);
+
+    // pagination cursor (opaque b64 of LastEvaluatedKey)
+    const cursor = req.query.cursor
+      ? JSON.parse(Buffer.from(String(req.query.cursor), 'base64').toString('utf8'))
+      : undefined;
+
+    // Base query: by City + Status in Dynamo (fast via GSI)
+    const baseParams = {
+      TableName: DDB_TABLE_LISTINGS,
+      IndexName: 'CityNorm-ModificationTimestamp-index',
+      KeyConditionExpression: 'CityNorm = :c',
+      FilterExpression: 'StandardStatus = :s',
+      ExpressionAttributeValues: { ':c': city, ':s': status },
+      ScanIndexForward: false, // newest first
+      Limit: limit,
+      ExclusiveStartKey: cursor
+    };
+
+    const listings = [];
+    let lastKey = cursor;
+    let finished = false;
+
+    // page through until we collect "limit" matches or run out
+    while (!finished && listings.length < limit) {
+      const params = { ...baseParams, ExclusiveStartKey: lastKey };
+      const resp = await ddb.send(new QueryCommand(params));
+      const page = resp.Items || [];
+
+      for (const v of page) {
+        if (listings.length >= limit) break;
+
+        // Bedrooms filter (treat null/NaN as 0)
+        const b = typeof v.BedroomsTotal === 'number' ? v.BedroomsTotal : 0;
+        if (b < bedsMin || b > bedsMax) continue;
+
+        // Subtype filter (optional, case-insensitive substring match)
+        const pst = (v.PropertySubType || '').toString().toLowerCase();
+        if (subFilters.length && !subFilters.some(f => pst.includes(f))) continue;
+
+        // Map to thin UI shape (same as /api/search/city)
+        listings.push({
+          ListingKey: v.ListingKey,
+          City: v.City,
+          propertyType: v.PropertyType ?? null,
+          propertySubType: v.PropertySubType ?? null,
+          PostalCode: v.PostalCode,
+          StateOrProvince: v.StateOrProvince,
+          StandardStatus: v.StandardStatus,
+          ListPrice: v.ListPrice,
+          BedroomsTotal: v.BedroomsTotal,
+          BathroomsTotalInteger: v.BathroomsTotalInteger,
+          LivingArea: v.LivingArea,
+          ModificationTimestamp: v.ModificationTimestamp,
+          PhotosChangeTimestamp: v.PhotosChangeTimestamp,
+          address: (v.InternetAddressDisplayYN === false) ? null : (v.UnparsedAddress ?? null),
+          primaryPhotoUrl: v.CdnPrimary400 ?? v.PrimaryPhotoUrl ?? null
+        });
+      }
+
+      lastKey = resp.LastEvaluatedKey;
+      if (!lastKey || listings.length >= limit) {
+        finished = true;
+      }
+    }
+
+    const next = lastKey ? Buffer.from(JSON.stringify(lastKey)).toString('base64') : null;
+
+    res.set('Cache-Control', 'private, max-age=15').json({
+      city,
+      status,
+      bedsMin,
+      bedsMax,
+      subType: subFilters.length ? subFilters : null,
+      returned: listings.length,
+      cursor: next,
+      listings
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'units search failed', message: err?.message || String(err) });
+  }
+});
+
+
 
 /* --------------------------------- Server -------------------------------- */
 app.listen(PORT, () => {
