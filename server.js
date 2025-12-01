@@ -1904,6 +1904,80 @@ app.get('/api/search/units', async (req, res) => {
   }
 });
 
+// GET /webapi/property/by-agent-mlsid?agentMlsId=cv34524&status=Active&days=180&top=100
+app.get('/webapi/property/by-agent-mlsid', async (req, res) => {
+  try {
+    const agentMlsId = String(req.query.agentMlsId || '').trim();
+    if (!agentMlsId) return res.status(400).json({ error: 'agentMlsId is required' });
+
+    const days = Math.min(Math.max(parseInt(req.query.days || '180', 10), 1), 365);
+    const top  = Math.min(Math.max(parseInt(req.query.top  || '100', 10), 1), 1000);
+    const status = String(req.query.status || 'Active').trim();
+
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const esc = s => s.replace(/'/g, "''");
+
+    const select = [
+      'ListingKey',
+      'StandardStatus',
+      'City','StateOrProvince','PostalCode',
+      'UnparsedAddress',
+      'ListPrice','BedroomsTotal','BathroomsTotalInteger','LivingArea',
+      'PropertyType','PropertySubType',
+      'ListAgentFullName','ListAgentMlsId','ListOfficeName',
+      'ModificationTimestamp',
+      // grab 1 primary photo if available
+      // (many boards allow this in IDX when InternetEntireListingDisplayYN is true)
+    ].join(',');
+
+    const filter = [
+      `ListAgentMlsId eq '${esc(agentMlsId)}'`,
+      `StandardStatus eq '${esc(status)}'`,
+      `InternetEntireListingDisplayYN eq true`,
+      `ModificationTimestamp ge ${since}`
+    ].join(' and ');
+
+    const p = new URLSearchParams();
+    p.set('$select', select);
+    p.set('$filter', filter);
+    p.set('$orderby', 'ModificationTimestamp desc');
+    p.set('$top', String(top));
+    if (process.env.PRETTY_ENUMS === 'true') p.set('PrettyEnums', 'true');
+    // 1 photo via $expand (optional; some feeds throttle this—safe to remove if needed)
+    p.set('$expand', 'Media($select=MediaURL,Order;$orderby=Order;$top=1)');
+
+    const data = await trestleFetch(`/Property?${p.toString()}`);
+
+    const listings = (data.value || []).map(v => ({
+      ListingKey: v.ListingKey,
+      StandardStatus: v.StandardStatus,
+      City: v.City, StateOrProvince: v.StateOrProvince, PostalCode: v.PostalCode,
+      address: v.UnparsedAddress ?? null,
+      ListPrice: v.ListPrice,
+      BedroomsTotal: v.BedroomsTotal,
+      BathroomsTotalInteger: v.BathroomsTotalInteger,
+      LivingArea: v.LivingArea,
+      propertyType: v.PropertyType ?? null,
+      propertySubType: v.PropertySubType ?? null,
+      agentName: v.ListAgentFullName ?? null,
+      agentMlsId: v.ListAgentMlsId ?? null,
+      officeName: v.ListOfficeName ?? null,
+      ModificationTimestamp: v.ModificationTimestamp,
+      primaryPhotoUrl: (Array.isArray(v.Media) && v.Media[0]?.MediaURL) ? v.Media[0].MediaURL : null
+    }));
+
+    res.set('Cache-Control', 'no-store').json({
+      agentMlsId,
+      status,
+      since,
+      returned: listings.length,
+      listings
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: 'agent lookup failed', message: err?.message || String(err) });
+  }
+});
 
 
 /* --------------------------------- Server -------------------------------- */
