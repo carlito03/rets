@@ -2051,6 +2051,90 @@ app.get('/api/search/agent', async (req, res) => {
   }
 });
 
+// Admin: ingest listings for a specific agent by MLS ID (case-insensitive)
+app.get('/admin/ingest/agent', async (req, res) => {
+  try {
+    const raw = String(req.query.agentId || '').trim();
+    if (!raw) return res.status(400).json({ error: 'agentId is required' });
+
+    const agentId = raw.toUpperCase();
+    const days = Math.min(Math.max(parseInt(req.query.days || '180', 10), 1), 365);
+    const status = String(req.query.status || 'Active').trim();
+
+    const since = new Date(Date.now() - days * 86400_000).toISOString();
+    const esc = s => s.replace(/'/g, "''");
+
+    const select = [
+      'ListingKey','StandardStatus','City','CountyOrParish','PostalCode','StateOrProvince',
+      'ListPrice','PropertyType','PropertySubType',
+      'BedroomsTotal','BathroomsTotalInteger','LivingArea',
+      'ModificationTimestamp','PhotosChangeTimestamp',
+      'UnparsedAddress','InternetAddressDisplayYN',
+      'SpecialListingConditions',
+      'ListAgentMlsId','ListAgentFullName'
+    ].join(',');
+
+    const filter = [
+      `InternetEntireListingDisplayYN eq true`,
+      `StandardStatus eq '${esc(status)}'`,
+      `ModificationTimestamp ge ${since}`,
+      `toupper(ListAgentMlsId) eq '${esc(agentId)}'`
+    ].join(' and ');
+
+    const base = new URLSearchParams();
+    base.set('$select', select);
+    base.set('$filter', filter);
+    base.set('$orderby', 'ModificationTimestamp desc');
+    base.set('$top', '100');
+    if (PRETTY_ENUMS === 'true') base.set('PrettyEnums', 'true');
+
+    let url = `/Property?${base.toString()}`;
+    const all = [];
+    while (url) {
+      const data = await trestleFetch(url);
+      const page = (data.value || []).map(v => ({
+        ListingKey: v.ListingKey,
+        City: v.City,
+        CityNorm: toNorm(v.City),
+        CountyOrParish: v.CountyOrParish ?? null,
+        PostalCode: v.PostalCode,
+        StateOrProvince: v.StateOrProvince,
+        PropertyType: v.PropertyType,
+        PropertySubType: v.PropertySubType,
+        StandardStatus: v.StandardStatus,
+        ListPrice: v.ListPrice,
+        BedroomsTotal: v.BedroomsTotal,
+        BathroomsTotalInteger: v.BathroomsTotalInteger,
+        LivingArea: v.LivingArea,
+        ModificationTimestamp: toIsoUtc(v.ModificationTimestamp),
+        PhotosChangeTimestamp: toIsoUtc(v.PhotosChangeTimestamp),
+        UnparsedAddress: (v.InternetAddressDisplayYN === false) ? null : (v.UnparsedAddress ?? null),
+        InternetAddressDisplayYN: v.InternetAddressDisplayYN ?? null,
+        SpecialListingConditions: Array.isArray(v.SpecialListingConditions) ? v.SpecialListingConditions : [],
+        PrimaryPhotoUrl: null,
+        ListAgentMlsId: v.ListAgentMlsId ?? null,
+        ListAgentFullName: v.ListAgentFullName ?? null,
+        AgentMlsIdUpper: v.ListAgentMlsId ? String(v.ListAgentMlsId).toUpperCase() : null
+      }));
+      all.push(...page);
+
+      url = data['@odata.nextLink'] || null;
+      if (url) await sleep(120);
+    }
+
+    let written = 0, skipped = 0;
+    for (const it of all) {
+      const r = await upsertThinListing(it);
+      if (r.skipped) skipped++; else written++;
+    }
+
+    res.json({ agentId, fetched: all.length, written, skipped });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: 'agent ingest failed', message: err?.message || String(err) });
+  }
+});
+
 
 
 /* --------------------------------- Server -------------------------------- */
