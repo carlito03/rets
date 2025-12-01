@@ -298,6 +298,9 @@ async function upsertThinListing(item) {
   const UpdateExpression = `
     SET City = :City,
         CityNorm = :CityNorm,
+        ListAgentMlsId = :ListAgentMlsId,
+        ListAgentFullName = :ListAgentFullName,
+        AgentMlsIdUpper = :AgentMlsIdUpper,
         CountyOrParish = :CountyOrParish,
         PostalCode = :PostalCode,
         StateOrProvince = :StateOrProvince,
@@ -333,6 +336,9 @@ async function upsertThinListing(item) {
       ':CountyOrParish': CountyOrParish ?? null,          // NEW
       ':PropertyType': PropertyType ?? null,
       ':PropertySubType': PropertySubType ?? null,
+      ':ListAgentMlsId': item.ListAgentMlsId ?? null,
+      ':ListAgentFullName': item.ListAgentFullName ?? null,
+      ':AgentMlsIdUpper': (item.AgentMlsIdUpper ?? (item.ListAgentMlsId ? String(item.ListAgentMlsId).toUpperCase() : null)),
       ':PostalCode': PostalCode ?? null,
       ':StateOrProvince': StateOrProvince ?? null,
       ':StandardStatus': StandardStatus ?? null,
@@ -736,6 +742,8 @@ app.get('/admin/ingest/city', async (req, res) => {
       'LivingArea',
       'ModificationTimestamp',
       'PhotosChangeTimestamp',
+       'ListAgentMlsId',
+      'ListAgentFullName',
       'UnparsedAddress',
       'InternetAddressDisplayYN',
       'SpecialListingConditions'
@@ -804,6 +812,9 @@ app.get('/admin/ingest/city', async (req, res) => {
         LivingArea: v.LivingArea,
         ModificationTimestamp: toIsoUtc(v.ModificationTimestamp),
         PhotosChangeTimestamp: toIsoUtc(v.PhotosChangeTimestamp),
+         ListAgentMlsId: v.ListAgentMlsId ?? null,
+  ListAgentFullName: v.ListAgentFullName ?? null,
+  AgentMlsIdUpper: v.ListAgentMlsId ? String(v.ListAgentMlsId).toUpperCase() : null,
         // NEW: store null if address display is disallowed
         UnparsedAddress: (v.InternetAddressDisplayYN === false) ? null : (v.UnparsedAddress ?? null),
         InternetAddressDisplayYN: v.InternetAddressDisplayYN ?? null,
@@ -1978,6 +1989,68 @@ app.get('/webapi/property/by-agent-mlsid', async (req, res) => {
     res.status(502).json({ error: 'agent lookup failed', message: err?.message || String(err) });
   }
 });
+
+// Search thin listings by agent (via GSI)
+app.get('/api/search/agent', async (req, res) => {
+  try {
+    const raw = String(req.query.agentId || '').trim();
+    if (!raw) return res.status(400).json({ error: 'agentId is required' });
+
+    const agentIdUpper = raw.toUpperCase();
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10), 1), 100);
+
+    // cursor
+    const cursor = req.query.cursor
+      ? JSON.parse(Buffer.from(String(req.query.cursor), 'base64').toString('utf8'))
+      : undefined;
+
+    const params = {
+      TableName: DDB_TABLE_LISTINGS,
+      IndexName: 'AgentMlsIdUpper-ModificationTimestamp-index', // or ...-ModEpoch-index
+      KeyConditionExpression: 'AgentMlsIdUpper = :a',
+      ExpressionAttributeValues: { ':a': agentIdUpper },
+      ScanIndexForward: false,      // newest first
+      Limit: limit,
+      ExclusiveStartKey: cursor
+    };
+
+    const resp = await ddb.send(new QueryCommand(params));
+
+    const listings = (resp.Items || []).map(v => ({
+      ListingKey: v.ListingKey,
+      City: v.City,
+      PostalCode: v.PostalCode,
+      StateOrProvince: v.StateOrProvince,
+      StandardStatus: v.StandardStatus,
+      ListPrice: v.ListPrice,
+      BedroomsTotal: v.BedroomsTotal,
+      BathroomsTotalInteger: v.BathroomsTotalInteger,
+      LivingArea: v.LivingArea,
+      propertyType: v.PropertyType ?? null,
+      propertySubType: v.PropertySubType ?? null,
+      address: (v.InternetAddressDisplayYN === false) ? null : (v.UnparsedAddress ?? null),
+      primaryPhotoUrl: v.CdnPrimary400 ?? v.PrimaryPhotoUrl ?? null,
+      // optional: agent echo
+      ListAgentMlsId: v.ListAgentMlsId ?? null,
+      ListAgentFullName: v.ListAgentFullName ?? null
+    }));
+
+    const next = resp.LastEvaluatedKey
+      ? Buffer.from(JSON.stringify(resp.LastEvaluatedKey)).toString('base64')
+      : null;
+
+    res.set('Cache-Control', 'private, max-age=15').json({
+      agentId: agentIdUpper,
+      returned: listings.length,
+      cursor: next,
+      listings
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'agent search failed', message: err?.message || String(err) });
+  }
+});
+
 
 
 /* --------------------------------- Server -------------------------------- */
